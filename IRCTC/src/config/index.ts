@@ -15,6 +15,7 @@ interface Config {
   LOG_LEVEL: string;
   REDIS_URL: string;
   ALLOWED_ORIGINS: string;
+  DATABASE_URL: string;
 }
 
 export const config: Config = {
@@ -24,4 +25,5 @@ export const config: Config = {
   LOG_LEVEL: process.env.LOG_LEVEL || "info",
   REDIS_URL: process.env.REDIS_URL || "redis://irctcpass@redis:6379",
   ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS || "http://localhost:4000",
+  DATABASE_URL: process.env.DATABASE_URL || "postgresql://postgres:password@localhost:5432/irctc",
 };
