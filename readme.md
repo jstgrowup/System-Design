@@ -1,4 +1,4 @@
-# IRCTC Backend System Clone
+# IRCTC Backend System
 
 This project is a production-ready **IRCTC-like backend system** built from scratch using a microservices architecture. It demonstrates how to build scalable, distributed systems using industry-standard engineering practices.
 
