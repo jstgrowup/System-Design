@@ -1,13 +1,28 @@
 import express from "express";
-import askAiRoute from "./routes";
-import { errorHandler } from "./middlewares/errorHandler";
-
+import cookieParser from "cookie-parser";
+import helmet from "helmet";
+import { config } from "./config";
+import logger from "./config/logger";
+import { corsMiddleware } from "./middlewares/cors.middleware";
+import errorHandler from "./middlewares/error.middleware";
+import { reqLogger } from "./middlewares/req.middleware";
 const app = express();
 
+app.use(helmet());
+app.use(corsMiddleware);
+app.use(reqLogger);
+app.use(cookieParser());
 app.use(express.json());
 
-// Routes
-app.use("/api/ask", askAiRoute);
+app.get("/", (req, res) => {
+  res.send("Hello from index.js of user-service");
+});
 
+app.get("/health", (req, res) => {
+  res.status(200).json({
+    message: "ok",
+  });
+});
 app.use(errorHandler);
+
 export default app;
