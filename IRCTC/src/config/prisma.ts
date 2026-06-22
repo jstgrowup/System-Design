@@ -1,31 +1,20 @@
-import { PrismaClient } from '@prisma/client';
-import { PrismaPg } from '@prisma/adapter-pg';
-import pg from 'pg';
-import { config } from './index.js';
+import { PrismaClient } from "@prisma/client";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { config } from "./index";
 
-// Define a type extending the Node global object to handle our cached client safely
-interface CustomGlobal extends typeof globalThis {
-    prisma?: PrismaClient;
+declare global {
+  var prisma: PrismaClient | undefined;
 }
 
-const globalForPrisma = global as CustomGlobal;
-
-let prisma: PrismaClient;
-
-if (!globalForPrisma.prisma) {
-    // 1. Establish a PostgreSQL connection pool via the 'pg' library
-    const pool = new pg.Pool({ connectionString: config.DATABASE_URL });
-    
-    // 2. Instantiate the Prisma PostgreSQL driver adapter with the pool instance
-    const adapter = new PrismaPg(pool);
-
-    // 3. Create the centralized Client instance
-    globalForPrisma.prisma = new PrismaClient({
-        adapter,
-        log: ['error', 'warn'],
-    });
+function createPrismaClient(): PrismaClient {
+  const adapter = new PrismaPg(config.DATABASE_URL);
+  return new PrismaClient({ adapter, log: ["error", "warn"] });
 }
 
-prisma = globalForPrisma.prisma;
+const prisma: PrismaClient = globalThis.prisma ?? createPrismaClient();
+
+if (process.env.NODE_ENV !== "production") {
+  globalThis.prisma = prisma;
+}
 
 export default prisma;
