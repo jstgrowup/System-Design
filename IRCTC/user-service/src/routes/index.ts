@@ -1,8 +1,8 @@
 import { Router } from "express";
-import { askAi } from "../controllers/auth.controller";
+import { authController } from "../controllers/auth.controller";
 
 const router = Router();
 
-router.post("/", askAi);
+router.post("/", authController.sendOtp);
 
 export default router;

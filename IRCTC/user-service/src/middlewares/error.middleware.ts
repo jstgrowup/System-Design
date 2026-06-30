@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import { AppError } from "../utils/error.js";
+import { AppError } from "../utils/error";
 
 // Note: Express requires all 4 parameters (err, req, res, next) to recognize this as an error-handling middleware.
 const errorHandler = (
