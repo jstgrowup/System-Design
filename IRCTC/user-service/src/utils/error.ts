@@ -37,3 +37,24 @@ export class NotFoundError extends AppError {
     super(message, 404, code);
   }
 }
+
+export class ConflictError extends AppError {
+  constructor(message: string, code: string = "CONFLICT") {
+    super(message, 409, code);
+  }
+}
+
+export class TooManyRequestsError extends AppError {
+  constructor(message: string, code: string = "TOO_MANY_REQUESTS") {
+    super(message, 429, code);
+  }
+}
+
+export class InternalServerError extends AppError {
+  constructor(
+    message: string = "Internal Server Error",
+    code: string = "SERVER_ERROR",
+  ) {
+    super(message, 500, code);
+  }
+}
