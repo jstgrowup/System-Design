@@ -3,6 +3,7 @@ import prisma from "../config/prisma";
 import { ConflictError } from "../utils/error";
 import bcrypt from "bcrypt";
 import emailService from "../utils/email";
+import { generateAndStoreOtp } from "../utils/otp";
 const sendOTP = async ({
   firstName,
   lastName,
@@ -19,7 +20,7 @@ const sendOTP = async ({
     throw new ConflictError("User Already exists");
   }
   const hashedPassword = await bcrypt.hash(password, 12);
-  const meta = { firstName, lastName, email, password };
+  const meta = { firstName, lastName, email, password: hashedPassword };
   const { otp, otpSessionId } = await generateAndStoreOtp(meta);
   await emailService.sendOtpEmail(email, otp, 5);
   return otpSessionId;

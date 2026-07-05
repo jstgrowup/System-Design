@@ -34,6 +34,7 @@ interface Config {
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
   INTERNAL_SERVICE_KEY?: string;
+  RESEND_API_KEY?: string;
 }
 
 export const config: Config = {
@@ -67,4 +68,5 @@ export const config: Config = {
   GOOGLE_CLIENT_SECRET: process.env.GOOGLE_CLIENT_SECRET,
 
   INTERNAL_SERVICE_KEY: process.env.INTERNAL_SERVICE_KEY,
+  RESEND_API_KEY: process.env.RESEND_API_KEY,
 };

@@ -1,0 +1,8 @@
+{
+  "$schema": "https://assets.requestly.com/local/v1.12.0/requestly-config.json",
+  "version": "1.2.0",
+  "include": [
+    "**"
+  ],
+  "exclude": []
+}

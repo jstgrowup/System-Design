@@ -1,6 +1,6 @@
 import { Redis } from "ioredis";
-import { config } from "./index.js";
-import logger from "./logger.js";
+import { config } from "./index";
+import logger from "./logger";
 
 export class RedisClient {
   private static instance: Redis | null = null;
@@ -11,6 +11,7 @@ export class RedisClient {
 
   public static getInstance(): Redis {
     if (!RedisClient.instance) {
+      console.log("config.REDIS_URL:", config.REDIS_URL);
       RedisClient.instance = new Redis(config.REDIS_URL, {
         retryStrategy: (times: number): number | null => {
           const delay = Math.min(times * 50, 2000);
