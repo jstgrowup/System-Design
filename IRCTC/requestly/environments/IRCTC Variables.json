@@ -1,0 +1,13 @@
+{
+  "$schema": "https://assets.requestly.com/local/v1.12.0/environment.json",
+  "id": "cb9fdf3f-8172-4ba0-9cb8-2f7b2072b2ad",
+  "variables": {
+    "BACKEND_HOST": {
+      "id": "33e8f67f-2dbd-4f72-9ced-4ac0c6ba784f",
+      "syncValue": "http://localhost:4001/api/v1",
+      "type": "string",
+      "isEnabled": true,
+      "rank": "hmr830dpp"
+    }
+  }
+}

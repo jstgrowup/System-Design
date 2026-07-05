@@ -1,10 +1,8 @@
 import { Response } from "express";
-export interface ApiResponseType {
-  success?: boolean;
-  message?: string;
-  data?: any;
-  errors?: any;
-}
+export type ApiResponseType = {
+  message: string;
+  data?: Record<string, unknown>;
+};
 
 export const SuccessResponse = (
   res: Response,
@@ -15,7 +13,6 @@ export const SuccessResponse = (
     success: true,
     message: params.message,
     data: params?.data ?? {},
-    errors: params?.errors ?? {},
   });
 };
 
@@ -27,7 +24,5 @@ export const ErrorResponse = (
   return res.status(statusCode).json({
     success: false,
     message: params.message,
-    data: params?.data ?? {},
-    errors: params?.errors ?? {},
   });
 };

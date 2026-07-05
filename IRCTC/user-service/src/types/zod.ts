@@ -1,5 +1,5 @@
 import { z } from "zod";
-export const zSignUp = z.object({
+export const zSendOtp = z.object({
   firstName: z
     .string({ error: "First name is required" })
     .min(4, "First name must be at least 4 characters")
@@ -14,4 +14,11 @@ export const zSignUp = z.object({
     .regex(/[a-z]/, "Password must contain at least one lowercase letter")
     .regex(/[0-9]/, "Password must contain at least one number"),
 });
-export type SignUpBodyType = z.infer<typeof zSignUp>;
+export type SendOtpBodyType = z.infer<typeof zSendOtp>;
+export const zVerifyOtp = z.object({
+  otp: z
+    .string({ error: "OTP is required" })
+    .length(6, "OTP must be exactly 6 digits")
+    .regex(/^\d{6}$/, "OTP must contain only digits"),
+});
+export type VerifyOtpBodyType = z.infer<typeof zSendOtp>;
