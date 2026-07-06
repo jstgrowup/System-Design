@@ -1,4 +1,5 @@
 import { z } from "zod";
+
 export const zSendOtp = z.object({
   firstName: z
     .string({ error: "First name is required" })
@@ -15,13 +16,15 @@ export const zSendOtp = z.object({
     .regex(/[0-9]/, "Password must contain at least one number"),
 });
 export type SendOtpBodyType = z.infer<typeof zSendOtp>;
+
 export const zVerifyOtp = z.object({
   otp: z
     .string({ error: "OTP is required" })
     .length(6, "OTP must be exactly 6 digits")
     .regex(/^\d{6}$/, "OTP must contain only digits"),
 });
-export type VerifyOtpBodyType = z.infer<typeof zSendOtp>;
+export type VerifyOtpBodyType = z.infer<typeof zVerifyOtp>;
+
 export const zLogin = z.object({
   email: z.email("Invalid email format").trim().toLowerCase(),
   password: z
