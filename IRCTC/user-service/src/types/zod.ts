@@ -22,3 +22,13 @@ export const zVerifyOtp = z.object({
     .regex(/^\d{6}$/, "OTP must contain only digits"),
 });
 export type VerifyOtpBodyType = z.infer<typeof zSendOtp>;
+export const zLogin = z.object({
+  email: z.email("Invalid email format").trim().toLowerCase(),
+  password: z
+    .string({ error: "Password is required" })
+    .min(8, "Password must be at least 8 characters")
+    .regex(/[A-Z]/, "Password must contain at least one uppercase letter")
+    .regex(/[a-z]/, "Password must contain at least one lowercase letter")
+    .regex(/[0-9]/, "Password must contain at least one number"),
+});
+export type LoginBodyType = z.infer<typeof zLogin>;
