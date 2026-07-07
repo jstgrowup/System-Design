@@ -1,7 +1,5 @@
 # Auth Flow — Technical Reference
 
-Complete guide for new engineers joining the team.
-
 Version 1.0 · July 2026
 
 ---
@@ -87,6 +85,8 @@ Registration is intentionally split into two HTTP requests. No user row is creat
 
 ### 4.1 Step 1 — `POST /auth/send-otp`
 
+This is the entry point to registration. Its only job is to validate the signup payload, make sure the email isn't already taken, generate a one-time code, and get that code to the user's inbox — without ever writing anything to the permanent database yet.
+
 **What the client sends**
 
 ```http
@@ -101,23 +101,115 @@ Content-Type: application/json
 }
 ```
 
-**What happens inside**
+`lastName` is optional — everything else is required.
 
-1. Zod validates the body (`zSendOtp` schema).
-   - `firstName`: min 4, max 40 chars
-   - `email`: valid format, lowercased, trimmed
-   - `password`: min 8 chars, must contain uppercase, lowercase, and digit
-2. Service checks Postgres — throws `409 ConflictError` if email already registered.
-3. Password is bcrypt-hashed immediately (cost 12) — plaintext is never stored anywhere.
-4. OTP utility runs:
-   - Checks Redis rate key `otp:rate:{email}` — throws `429` if ≥ 5 requests in the last hour
-   - Generates a 6-digit numeric OTP via `otp-generator`
-   - Creates a UUID as the `otpSessionId`
-   - Computes `HMAC-SHA256(OTP_HMAC_SECRET, email:otp)` — stores only the hash, never the OTP
-   - Writes `{ hashedOtp, meta }` to Redis at `otp:session:{otpSessionId}` with TTL = `OTP_TTL`
-   - Increments `otp:rate:{email}` and sets a 1-hour expiry
-5. Resend sends the OTP email with retry logic (up to 3 attempts, exponential backoff).
-6. `otpSessionId` is set as an httpOnly, secure, `sameSite=strict` cookie named `otp_session`.
+#### Step-by-step breakdown
+
+**1. Request validation (Zod — `zSendOtp` schema)**
+
+| Field       | Rules                                                                    | Notes                                                                                                                          |
+| ----------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------ |
+| `firstName` | required, string, min 4, max 40 chars, trimmed                           | Rejects `undefined` with a custom "First name is required" message                                                             |
+| `lastName`  | optional, string, max 40 chars, trimmed                                  | Defaults to `""` in the controller if omitted                                                                                  |
+| `email`     | required, valid email format, trimmed, lowercased                        | Lowercasing happens _before_ the uniqueness check, so `Alice@Example.com` and `alice@example.com` are treated as the same user |
+| `password`  | required, min 8 chars, must contain ≥1 uppercase, ≥1 lowercase, ≥1 digit | No special-character requirement currently enforced                                                                            |
+
+If any rule fails, `zSendOtp.safeParse()` returns `success: false`. The controller short-circuits immediately and responds `400` with the formatted Zod message — the request never reaches the service layer, Postgres, or Redis.
+
+**2. Duplicate email check**
+
+```ts
+const existingUser = await prisma.user.findUnique({ where: { email } });
+if (existingUser) throw new ConflictError("User already exists");
+```
+
+This is a hard stop — `409 CONFLICT`. It happens _before_ any OTP is generated, so a duplicate signup attempt never triggers an email send or touches the rate limiter.
+
+> This does mean an attacker can determine whether an email is already registered (a form of account enumeration). If that's a concern for your product, consider returning a generic "if this email is available you'll receive an OTP" response instead — see Security Design Decisions for the trade-off this codebase currently makes.
+
+**3. Password hashing**
+
+```ts
+const hashedPassword = await bcrypt.hash(password, 12);
+```
+
+The plaintext password from the request body is hashed immediately, before anything is persisted anywhere — including Redis. Cost factor 12 is used consistently across the app (see `login` for the matching `bcrypt.compare`).
+
+**4. OTP generation & storage (`generateAndStoreOtp` in `otp.ts`)**
+
+This is the most involved step. It runs as a single function but does five distinct things in order:
+
+a. **Rate limit check** — reads `otp:rate:{email}` from Redis.
+
+```ts
+if (sentCount >= RATE_MAX) throw new TooManyRequestsError(...)  // 429
+```
+
+`RATE_MAX` comes from `OTP_RATE_MAX_PER_HOUR` (default 5 if unset). This check happens _before_ a new OTP is generated, so hitting the limit costs no extra OTP-generation work.
+
+b. **OTP generation** — `otp-generator` produces a 6-digit numeric string (no letters, no symbols):
+
+```ts
+otpGenerator.generate(6, {
+  upperCaseAlphabets: false,
+  lowerCaseAlphabets: false,
+  specialChars: false,
+});
+```
+
+c. **Session ID creation** — `crypto.randomUUID()` generates a unique `otpSessionId`. This ID (not the OTP, not the email) is what the client will hold onto via cookie between requests.
+
+d. **HMAC hashing** — the OTP is never stored raw:
+
+```ts
+const hashed = crypto
+  .createHmac("sha256", OTP_HMAC_SECRET)
+  .update(`${email}:${otp}`)
+  .digest("hex");
+```
+
+Binding the email into the HMAC input means the same 6-digit OTP hashes differently per user, so there's no shared lookup table risk across accounts.
+
+e. **Redis write** — the registration payload is packaged and stored under the session ID:
+
+```ts
+await redis.set(
+  `otp:session:${otpSessionId}`,
+  JSON.stringify({
+    hashedOtp: hashed,
+    meta: { firstName, lastName, email, password: hashedPassword },
+  }),
+  "EX",
+  OTP_TTL,
+);
+```
+
+This is the **only** place the user's registration data lives until they verify — it's not in Postgres yet. If they never verify, this key simply expires (`OTP_TTL`, default 300s) and the signup attempt disappears with no trace.
+
+f. **Rate counter increment** — `otp:rate:{email}` is incremented and given (or refreshed to) a 1-hour expiry, so the 5-per-hour window is a rolling one hour from the _first_ send in that window, not a fixed clock hour.
+
+**5. Sending the email**
+
+```ts
+await emailService.sendOtpEmail(email, otp, 5);
+```
+
+This is where the plaintext OTP is used for the only time in the entire flow — to put it in the email body. The email service (`EmailService.sendWithRetry`) wraps the Resend API call with up to 3 attempts and exponential backoff (1s, 2s, 4s) if delivery fails. If all 3 attempts fail, the error propagates up and the whole request fails with a 500 — the OTP session was already written to Redis at this point, so a client could theoretically retry `/send-otp` again once the transient email issue clears (subject to the rate limit).
+
+**6. Cookie assignment**
+
+Back in the controller, the returned `otpSessionId` is set as a cookie — this is what ties the _next_ request (`/verify-otp`) back to this Redis session, without the client ever seeing or handling the OTP session data directly:
+
+```ts
+res.cookie("otp_session", otpSessionId, {
+  httpOnly: true,
+  secure: true,
+  sameSite: "strict",
+  maxAge: config.OTP_TTL * 1000,
+});
+```
+
+The cookie's `maxAge` matches `OTP_TTL`, so the browser naturally drops the cookie at roughly the same time Redis expires the session — they're not linked mechanically, just configured to agree.
 
 **What the client receives**
 
@@ -128,9 +220,20 @@ Set-Cookie: otp_session=<uuid>; HttpOnly; Secure; SameSite=Strict; Max-Age=300
 { "success": true, "message": "OTP sent successfully" }
 ```
 
+#### Failure modes at a glance
+
+| Condition                                        | Status | Thrown by                    |
+| ------------------------------------------------ | ------ | ---------------------------- |
+| Missing/invalid field in body                    | 400    | Zod validation in controller |
+| Email already registered                         | 409    | `auth.service.sendOtp`       |
+| > 5 OTP requests for this email in the last hour | 429    | `generateAndStoreOtp`        |
+| Email provider fails after 3 retries             | 500    | `EmailService.sendWithRetry` |
+
 > **Security:** The OTP is never stored in Redis. Only its HMAC is. Even if Redis is compromised, an attacker cannot recover the OTP from the hash without knowing `OTP_HMAC_SECRET`.
 
 ### 4.2 Step 2 — `POST /auth/verify-otp`
+
+This endpoint is the only place in the entire registration flow where a row actually gets written to Postgres. Everything before this point lived in Redis and could vanish on TTL expiry with no trace.
 
 **What the client sends**
 
@@ -142,19 +245,105 @@ Cookie: otp_session=<uuid>
 { "otp": "482910" }
 ```
 
-**What happens inside**
+Note that the client never sends the email or session ID in the body — the session is entirely carried by the `otp_session` cookie set during step 1. This is deliberate: it means a captured request body alone (e.g. logged by a proxy) is useless without also having the cookie.
 
-1. Zod validates the body (`zVerifyOtp` schema) — must be exactly 6 numeric digits.
-2. `otpSessionId` is read from `req.cookies.otp_session` — throws `400` if missing.
-3. OTP verification runs:
-   - Fetches `{ hashedOtp, meta }` from Redis at `otp:session:{otpSessionId}`
-   - Returns `null` (→ `400`) if the key is missing or expired
-   - Checks `otp:attempt:{email}` — throws `429` if ≥ `OTP_MAX_VERIFY_ATTEMPTS` failures
-   - Re-computes HMAC of the submitted OTP
-   - Compares using `crypto.timingSafeEqual` to prevent timing attacks
-   - On success: deletes `otp:session`, `otp:attempt`, `otp:rate` keys from Redis
-   - On failure: increments `otp:attempt` counter
-4. If OTP is valid, Prisma creates the user row with `emailVerified: true`.
+#### Step-by-step breakdown
+
+**1. Request validation (Zod — `zVerifyOtp` schema)**
+
+| Field | Rules                                              | Notes                                                                                                                                  |
+| ----- | -------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| `otp` | required, string, exactly 6 chars, regex `^\d{6}$` | Both `.length(6)` and the regex are enforced — length alone would pass `"12ab56"`, so the regex catches non-numeric input specifically |
+
+**2. Cookie presence check**
+
+```ts
+const otpSessionId = req.cookies.otp_session;
+if (!otpSessionId) throw new BadRequestError("OTP session is missing");
+```
+
+This fires a `400` if the cookie was never set, already expired client-side, or the client is calling this endpoint without having gone through `/send-otp` first. It's a distinct failure from "OTP is wrong" — there's no Redis lookup at all yet at this point.
+
+**3. OTP verification (`verifyOtpViaUnHashing` in `otp.ts`)**
+
+This is the core of the endpoint and runs through several checks in sequence, each of which can short-circuit the request:
+
+a. **Session lookup** — fetches `otp:session:{otpSessionId}` from Redis.
+
+```ts
+const rawData = await redis.get(`otp:session:${otpSessionId}`);
+if (!rawData) return null; // → 400 Invalid or expired OTP
+```
+
+A `null` here means either the TTL expired (default 5 minutes) or the session was already consumed by a prior successful verification — Redis keys are deleted on success (see step e below), so this doubles as replay protection for the OTP itself.
+
+b. **Attempt counter check** — before even looking at the submitted OTP, it checks how many times this email has already gotten it wrong:
+
+```ts
+const attemptsCount = parseInt((await redis.get(`otp:attempt:${meta.email}`)) || "0", 10);
+if (attemptsCount >= config.OTP_MAX_VERIFY_ATTEMPTS) throw new TooManyRequestsError(...); // 429
+```
+
+Default limit is 5. This is scoped by **email**, not by session ID — so even if someone requests a fresh OTP (new session ID) for the same email mid-lockout, the attempt counter still applies. It only clears on a successful verification or natural TTL expiry.
+
+c. **HMAC recomputation** — the submitted OTP is hashed the same way it was during generation:
+
+```ts
+const hashedOtp = hmacFor({ email: meta.email, otp });
+```
+
+Note `meta.email` is used here (from the stored session), not anything from the request — the client has no way to influence which email the OTP is checked against.
+
+d. **Timing-safe comparison**:
+
+```ts
+crypto.timingSafeEqual(
+  Buffer.from(hashedOtp, "hex"),
+  Buffer.from(storedOtp, "hex"),
+);
+```
+
+A regular `===` comparison would return faster on an early mismatched byte than a late one, which — over enough requests — leaks information about how close a guess is. `timingSafeEqual` always takes the same amount of time regardless of where the mismatch occurs.
+
+e. **On success** — three keys are cleaned up together:
+
+```ts
+await redis.del(`otp:session:${otpSessionId}`, attemptsKey);
+await redis.del(`otp:rate:${meta.email}`);
+```
+
+This means a successful verification also resets the _rate limit_ counter, not just the attempt counter — a user who eventually gets it right isn't penalized on a future signup attempt by leftover rate-limit state.
+
+f. **On failure** — the attempt counter is bumped and its TTL is (re)set to `OTP_TTL`:
+
+```ts
+await redis.incr(attemptsKey);
+await redis.expire(attemptsKey, config.OTP_TTL);
+```
+
+The function returns `null` rather than throwing, so the controller treats a wrong OTP the same way as an expired session — both come back as `400 Invalid or expired OTP`. This is intentional: the client can't distinguish "your code was wrong" from "your code expired," which avoids leaking whether a session still exists.
+
+**4. User creation**
+
+Only after all of the above succeeds does anything touch Postgres:
+
+```ts
+const user = await prisma.user.create({
+  data: {
+    firstName: meta.firstName,
+    lastName: meta.lastName,
+    email: meta.email,
+    password: meta.hashedPassword, // already bcrypt-hashed back in step 1
+    emailVerified: true,
+  },
+});
+```
+
+The password stored here was hashed during `/send-otp`, not re-hashed here — `meta.hashedPassword` is carried through Redis exactly as it was written.
+
+**5. Response shaping**
+
+The created Prisma record includes the hashed password field by default. The service does not currently strip it before returning — worth checking against the "Known Bugs Fixed" table if you're auditing this endpoint, since the login flow has the equivalent fix applied but this path should be checked for the same pattern.
 
 **What the client receives**
 
@@ -167,13 +356,25 @@ HTTP 201
 }
 ```
 
-> **Note:** The password field is never returned in the user object. The service strips it before returning.
+#### Failure modes at a glance
+
+| Condition                                      | Status | Thrown by                              |
+| ---------------------------------------------- | ------ | -------------------------------------- |
+| `otp` not exactly 6 digits                     | 400    | Zod validation in controller           |
+| `otp_session` cookie missing                   | 400    | Controller                             |
+| Session expired / already used / never existed | 400    | `verifyOtpViaUnHashing` returns `null` |
+| ≥ 5 failed verify attempts for this email      | 429    | `verifyOtpViaUnHashing`                |
+| OTP does not match                             | 400    | `verifyOtpViaUnHashing` returns `null` |
+
+> **Note:** The password field is returned in the user object here — double check whether that's intended before shipping to production; the login endpoint deliberately strips it (see section 5) and this endpoint arguably should too.
 
 ---
 
 ## 5. Login Flow
 
 `POST /auth/login`
+
+This is a standard credential check, but it does meaningfully more work than "check password" — it also establishes a device-scoped session in Redis that the refresh-rotation logic (section 6) depends on.
 
 **What the client sends**
 
@@ -187,18 +388,105 @@ Content-Type: application/json
 }
 ```
 
-**What happens inside**
+#### Step-by-step breakdown
 
-1. Zod validates the body (`zLogin` schema).
-2. Device fingerprint is computed from `req.headers[user-agent]` + `req.ip` + `req.headers[accept]`, then SHA-256 hashed and sliced to 16 chars.
-3. Prisma looks up the user by email — throws `400` if not found.
-4. `bcrypt.compare` checks the submitted password against the stored hash — throws `400` if wrong.
-5. Two tokens are generated:
-   - Access token: `{ id: userId }`, signed with `JWT_ACCESS_SECRET`, expires in 15m
-   - Refresh token: `{ id: userId, jti: randomUUID() }`, signed with `JWT_REFRESH_SECRET`, expires in 7d
-6. The refresh token's JTI is stored in Redis at `refresh:{userId}:{deviceId}` with TTL = `REFRESH_TOKEN_EXP_SEC`.
-7. The safe user object (password stripped) is cached in Redis at `user:{userId}` with TTL = `REDIS_USER_TTL`.
-8. Both tokens are set as httpOnly cookies. The user object is returned in the response body.
+**1. Request validation (Zod — `zLogin` schema)**
+
+| Field      | Rules                                                                    | Notes                                                                                                                                      |
+| ---------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `email`    | required, valid email format, trimmed, lowercased                        | Same normalization as registration, so case differences never cause a false "not found"                                                    |
+| `password` | required, min 8 chars, must contain ≥1 uppercase, ≥1 lowercase, ≥1 digit | This is validating _shape_, not correctness — a syntactically valid but wrong password still passes Zod and fails at the bcrypt step below |
+
+**2. Device fingerprint generation**
+
+```ts
+const deviceId = getDeviceFingerprint(req);
+// SHA-256(userAgent + "|" + ip + "|" + accept) → first 16 hex chars
+```
+
+This runs _before_ the credentials are even checked against the database. It doesn't depend on anything about the user — it's purely a hash of request metadata, so the same physical browser/device will produce the same `deviceId` across login attempts, sessions, and even different accounts. This is what allows one refresh-token session per device per user, rather than per user globally.
+
+**3. User lookup**
+
+```ts
+const existingUser = await prisma.user.findUnique({ where: { email } });
+if (!existingUser || !existingUser.password)
+  throw new BadRequestError("Email not found");
+```
+
+The `!existingUser.password` check matters because it implies this schema supports users without a password set (e.g. an OAuth-only account, given the unused `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` env vars). Someone who signed up via Google and never set a password would correctly get "Email not found" rather than crashing on `bcrypt.compare(password, null)`.
+
+**4. Password comparison**
+
+```ts
+const doesPasswordMatch = await bcrypt.compare(password, existingUser.password);
+if (!doesPasswordMatch) throw new BadRequestError("Incorrect password");
+```
+
+Note this is a _different_ error message than "Email not found" above — which technically allows an attacker to enumerate which emails are registered (a valid email + wrong password returns a different message than a nonexistent email). Compare this to the account-enumeration trade-off flagged in `/send-otp` — this codebase currently accepts that risk in both places.
+
+**5. Token generation**
+
+Two independent JWTs are signed, using two different secrets:
+
+```ts
+const accessToken = generateAccessToken(existingUser.id);
+// payload: { id: userId }, secret: JWT_ACCESS_SECRET, expiresIn: 15m
+
+const refreshToken = generateRefreshToken(existingUser.id);
+// payload: { id: userId, jti: randomUUID() }, secret: JWT_REFRESH_SECRET, expiresIn: 7d
+```
+
+Using separate secrets means a leaked access-token secret can't be used to forge refresh tokens, and vice versa. The `jti` on the refresh token is the linchpin of the entire rotation/reuse-detection system covered in section 6 — the access token has no equivalent because it's never rotated or checked against Redis, it just expires naturally.
+
+**6. Redis session write**
+
+```ts
+const data = jwt.decode(refreshToken) as { jti: string };
+await redis.set(
+  `refresh:${existingUser.id}:${deviceId}`,
+  data.jti,
+  "EX",
+  config.REFRESH_TOKEN_EXP_SEC,
+);
+```
+
+Note this uses `jwt.decode`, not `jwt.verify` — decoding just reads the payload without checking the signature, which is fine here because the token was _just signed_ by this same process a line above; there's nothing to verify against an attacker.
+
+The key is composed of both `userId` and `deviceId`, so logging in from a second browser/device does not overwrite or invalidate the first session — each device gets its own independent refresh lineage.
+
+**7. User cache write**
+
+```ts
+const { password: _password, ...safeUser } = existingUser;
+await redis.set(
+  `user:${existingUser.id}`,
+  JSON.stringify(safeUser),
+  "EX",
+  config.REDIS_USER_TTL,
+);
+```
+
+This is a read-through cache for other parts of the app (e.g. an auth middleware that resolves `req.user` from the access token) to avoid a Postgres round-trip on every authenticated request. Destructuring `password` out before serializing is what keeps the hash out of this cache entirely.
+
+**8. Cookie assignment & response**
+
+```ts
+res.cookie("accessToken", accessToken, {
+  httpOnly: true,
+  secure: true,
+  sameSite: "strict",
+  maxAge: config.ACCESS_TOKEN_EXP_SEC * 1000,
+});
+res.cookie("refreshToken", refreshToken, {
+  httpOnly: true,
+  secure: true,
+  sameSite: "strict",
+  maxAge: config.REFRESH_TOKEN_EXP_SEC * 1000,
+});
+```
+
+Both cookies are set with identical flags — only the name, value, and `maxAge` differ. `loggedInUser` returned in the JSON body is `safeUser`, the same password-stripped object written to the Redis cache — not the raw Prisma record.
 
 **What the client receives**
 
@@ -214,6 +502,14 @@ Set-Cookie: refreshToken=<jwt>; HttpOnly; Secure; SameSite=Strict; Max-Age=60480
 }
 ```
 
+#### Failure modes at a glance
+
+| Condition                                            | Status | Thrown by                    |
+| ---------------------------------------------------- | ------ | ---------------------------- |
+| Invalid email format or weak password shape          | 400    | Zod validation in controller |
+| No user with this email, or user has no password set | 400    | `auth.service.login`         |
+| Password does not match stored hash                  | 400    | `auth.service.login`         |
+
 > **Security:** Tokens are set as httpOnly cookies so they are never accessible via `document.cookie` in the browser. This eliminates XSS-based token theft.
 
 ---
@@ -222,20 +518,112 @@ Set-Cookie: refreshToken=<jwt>; HttpOnly; Secure; SameSite=Strict; Max-Age=60480
 
 `POST /auth/refresh`
 
-When the access token expires (15m), the client silently calls `/auth/refresh`. No user interaction is needed — the browser automatically sends the httpOnly cookies.
+When the access token expires (15m), the client silently calls `/auth/refresh`. No user interaction is needed — the browser automatically sends the httpOnly cookies. This endpoint has no request body at all; everything it needs comes from cookies and headers.
 
-**What happens inside**
+#### Step-by-step breakdown
 
-1. Reads `refreshToken` from `req.cookies` — throws `401` if missing.
-2. Computes the device fingerprint (same algorithm as login).
-3. `jwt.verify` checks the signature and expiry — throws if tampered or expired.
-4. Extracts `userId` and `jti` from the payload.
-5. Looks up the stored JTI in Redis at `refresh:{userId}:{deviceId}`.
-   - If the key is missing → session expired → `403`, login again
-   - If the JTI does not match → token reuse detected → deletes the Redis key (invalidates the session) → `403`
-6. Issues new access and refresh tokens (new JTI each time).
-7. Writes the new JTI to Redis, replacing the old one.
-8. Sets both new tokens as cookies.
+**1. Refresh token presence check**
+
+```ts
+const refreshToken = req.cookies.refreshToken;
+if (!refreshToken)
+  throw new UnauthorizedError("Refresh token is missing", "LOGIN_AGAIN");
+```
+
+This fires `401` if the cookie is absent entirely — e.g. it expired client-side after 7 days, or the user is in a fresh browser with no session at all. The `LOGIN_AGAIN` code is meant to be a signal the frontend can key off of to redirect straight to the login screen rather than showing a generic error.
+
+**2. Device fingerprint recomputation**
+
+```ts
+const deviceId = getDeviceFingerprint(req);
+```
+
+This must produce the _same_ value it did at login time for the lookup in step 4 to succeed. Since the fingerprint is derived purely from `user-agent` + `ip` + `accept` headers, anything that changes those between login and refresh (switching networks, some browser updates, certain proxies rewriting headers) can change the fingerprint and effectively invalidate the session — this is a deliberate trade-off for tying sessions to devices without requiring a client-generated identifier.
+
+**3. Signature & expiry verification**
+
+```ts
+const payload = verifyRefreshToken(refreshToken); // jwt.verify — throws if invalid or expired
+const { id: userId, jti } = payload;
+```
+
+Unlike the `jwt.decode` used during login (section 5, step 6), this is a full `jwt.verify` — it checks the signature against `JWT_REFRESH_SECRET` and rejects the token outright if it's expired or has been tampered with in any way. If this throws, `asyncHandler` catches it and it surfaces as an error response before any Redis lookup happens.
+
+**4. JTI comparison against Redis — the reuse-detection core**
+
+```ts
+const storedJti = await redis.get(`refresh:${userId}:${deviceId}`);
+
+if (!storedJti) {
+  throw new ForbiddenError("Session expired", "LOGIN_AGAIN"); // 403
+}
+
+if (storedJti !== jti) {
+  await redis.del(`refresh:${userId}:${deviceId}`);
+  throw new ForbiddenError("Refresh token reused", "LOGIN_AGAIN"); // 403
+}
+```
+
+This is two separate failure branches with different meanings:
+
+- **No key found at all** — the session was never established for this device, or it already expired/was deleted (including by the reuse branch below on a _previous_ request). Treated as a normal "please log in again."
+- **Key exists but doesn't match** — the token presented is _valid_ (it passed signature verification in step 3) but it's an _old_ one that has already been rotated out. This is the signature of a replay: either the legitimate client rotated already and this is a stale copy, or a second party is holding a stolen copy and using it after the real owner already refreshed. Either way, the response is the same — the Redis key is deleted, killing the session for _both_ parties, and the caller must log in again.
+
+**5. Issuing new tokens**
+
+```ts
+const newAccessToken = generateAccessToken(payload.id);
+const newRefreshToken = generateRefreshToken(payload.id); // new random jti
+```
+
+Identical generation logic to login (section 5, step 5) — a fresh `jti` is created every single rotation, which is what makes the next refresh cycle's comparison in step 4 meaningful.
+
+**6. Redis key replacement**
+
+```ts
+const response = jwt.decode(newRefreshToken) as { jti: string };
+await redis.set(
+  `refresh:${payload.id}:${deviceId}`,
+  response.jti,
+  "EX",
+  config.REFRESH_TOKEN_EXP_SEC,
+);
+```
+
+This **overwrites** the same key from login rather than creating a new one — there is only ever one active JTI per `userId:deviceId` pair at a time. The TTL is also reset to the full `REFRESH_TOKEN_EXP_SEC` on every rotation, so an actively-used session can stay alive indefinitely past the original 7-day window, while an abandoned one still expires 7 days after its last refresh.
+
+**7. Cookie reassignment**
+
+```ts
+res.cookie("accessToken", newAccessToken, { ... });
+res.cookie("refreshToken", newRefreshToken, { ... });
+```
+
+Same cookie flags as login. The old refresh token cookie is simply overwritten — the browser has no way to "remember" the old one, so once this response is received, only the new token pair is usable going forward.
+
+**What the client receives**
+
+```http
+HTTP 200
+Set-Cookie: accessToken=<new-jwt>; HttpOnly; Secure; SameSite=Strict; Max-Age=900
+Set-Cookie: refreshToken=<new-jwt>; HttpOnly; Secure; SameSite=Strict; Max-Age=604800
+
+{
+  "success": true,
+  "message": "Access and refresh tokens reissued"
+}
+```
+
+Note there's no `data` field here — unlike login, this endpoint doesn't re-fetch or return the user object. If the frontend needs fresh user data after a refresh, it should hit a separate `/me`-style endpoint (backed by the `user:{userId}` Redis cache written at login) rather than expecting it from this response.
+
+#### Failure modes at a glance
+
+| Condition                             | Status                     | Meaning                                           |
+| ------------------------------------- | -------------------------- | ------------------------------------------------- |
+| `refreshToken` cookie missing         | 401                        | No session cookie present at all                  |
+| Signature invalid or token expired    | — (thrown by `jwt.verify`) | Tampered or past its 7-day expiry                 |
+| No Redis key for `userId:deviceId`    | 403                        | Session was never established, or already cleared |
+| Redis JTI doesn't match token's `jti` | 403                        | Reuse detected — stale or stolen token replayed   |
 
 ### Token Reuse Detection Explained
 
@@ -339,5 +727,3 @@ src/
 | `zod.ts`                  | `VerifyOtpBodyType` was inferred from `zSendOtp` instead of `zVerifyOtp`, giving it the full registration shape instead of `{ otp: string }`.              | Changed `z.infer<typeof zSendOtp>` → `z.infer<typeof zVerifyOtp>`.           |
 | `auth.service.ts` (login) | `loggedInUser` was returning the full `existingUser` object including the hashed password field.                                                           | Return `safeUser` (password-stripped object) instead of `existingUser`.      |
 | `utils/auth.ts`           | `ZodError` imported from `zod/v3` subpath, causing a type mismatch with the v4 `ZodError` returned by `safeParse`.                                         | Changed import from `zod/v3` → `zod`.                                        |
-
----
