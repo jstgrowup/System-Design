@@ -1,6 +1,6 @@
 import { producer, connectProducer } from "../../config/kafka";
 import logger from "../../config/logger";
-import { KAFKA_TOPICS } from "../../../../shared/kafka-topics";
+import { KAFKA_TOPICS } from "../../../../shared/constants/kafka-topics";
 
 interface OtpEmailPayload {
   email: string;

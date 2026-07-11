@@ -1,7 +1,6 @@
 import prisma from "../config/prisma";
 import { BadRequestError, ConflictError, ForbiddenError } from "../utils/error";
 import bcrypt from "bcrypt";
-import emailService from "../utils/email";
 import jwt from "jsonwebtoken";
 import { generateAndStoreOtp, verifyOtpViaUnHashing } from "../utils/otp";
 import {
@@ -52,7 +51,6 @@ const sendOtp = async ({
     ttlMinutes: config.OTP_TTL / 60,
   });
   logger.info(`OTP email queused for : ${email}`);
-  await emailService.sendOtpEmail(email, otp, 5);
 
   // Return session ID to be set as a cookie in the controller
   return otpSessionId;

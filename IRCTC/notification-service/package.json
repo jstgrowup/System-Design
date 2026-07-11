@@ -1,5 +1,5 @@
 {
-  "name": "codemaya-assignment",
+  "name": "Notification Service",
   "version": "1.0.0",
   "main": "index.js",
   "scripts": {
@@ -29,6 +29,7 @@
     "express": "^5.2.1",
     "kafkajs": "^2.2.4",
     "mongoose": "^9.4.1",
+    "resend": "^6.17.2",
     "winston": "^3.19.0"
   }
 }
