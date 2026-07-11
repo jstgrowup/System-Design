@@ -11,6 +11,8 @@ import {
 } from "../utils/auth";
 import { redis } from "../config/redis";
 import { config } from "../config";
+import notificationProducer from "../kafka/producer/notification-producer";
+import logger from "../config/logger";
 
 /**
  * Handles the first step of registration.
@@ -44,6 +46,12 @@ const sendOtp = async ({
   const { otp, otpSessionId } = await generateAndStoreOtp(meta);
 
   // Send OTP to user's email with a 5-minute TTL message
+  await notificationProducer.sendOtpEmail({
+    email,
+    otp,
+    ttlMinutes: config.OTP_TTL / 60,
+  });
+  logger.info(`OTP email queused for : ${email}`);
   await emailService.sendOtpEmail(email, otp, 5);
 
   // Return session ID to be set as a cookie in the controller
