@@ -1,3 +1,10 @@
+// ============================================
+// API Gateway - Main Entry Point
+// ============================================
+// This file initializes the Express application with all required middlewares,
+// sets up routes, and starts the HTTP server.
+// Request flow: Middleware → Routes → Error Handler
+
 import "dotenv/config";
 import express, { Request, Response, NextFunction } from "express";
 import helmet from "helmet";
@@ -11,6 +18,7 @@ import { corsMiddleware } from "./middlewares/cors.middleware";
 import { gatewayRouter } from "./routes/index";
 import { errorMiddleware } from "./middlewares/error.middleware";
 
+// Create Express application instance
 const app = express();
 
 app.use(corsMiddleware);

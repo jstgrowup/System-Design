@@ -4,7 +4,11 @@ import { config } from "../config";
 import { ServiceUnavailableError, GatewayTimeoutError } from "../utils/error";
 import logger from "../config/logger";
 
+// Types for circuit breaker states
 type CircuitState = "CLOSED" | "OPEN" | "HALF_OPEN";
+// CLOSED: Service is healthy, requests pass through normally
+// OPEN: Service is down, all requests fail fast (don't waste resources)
+// HALF_OPEN: Service might be recovering, allow one request to test
 
 interface CircuitBreakerStatus {
   service: string;
@@ -14,8 +18,16 @@ interface CircuitBreakerStatus {
 }
 
 /**
- * Circuit Breaker implementation.
- * Prevents cascading failures when downstream services are down.
+ * Circuit Breaker Pattern Implementation
+ *
+ * Prevents cascading failures by:
+ * 1. Monitoring downstream service failures
+ * 2. Stopping requests when service is down (OPEN state)
+ * 3. Periodically testing if service recovered (HALF_OPEN state)
+ * 4. Resuming normal operation when service recovers (CLOSED state)
+ *
+ * Without circuit breaker: Gateway keeps trying failing services → Resource waste
+ * With circuit breaker: Fail fast → Preserve resources → Allow recovery time
  */
 class CircuitBreaker {
   private serviceName: string;

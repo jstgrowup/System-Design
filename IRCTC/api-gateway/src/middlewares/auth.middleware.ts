@@ -1,3 +1,10 @@
+// ============================================
+// JWT Authentication Middleware
+// ============================================
+// Applied selectively per-route in routes/index.ts (e.g. requireAuth before
+// combinedRateLimit() on GET /users/user/profile). Routes that don't list it
+// — like POST /users/auth/login — remain publicly reachable.
+
 import { Request, Response, NextFunction } from "express";
 import jwt from "jsonwebtoken";
 import { config } from "../config";
@@ -32,44 +39,78 @@ export function requireAuth(
   try {
     let accessToken: string | undefined;
 
-    // 1. Try Authorization header (service-to-service / mobile clients)
+    // ============================================
+    // STEP 1: Try Authorization Header
+    // ============================================
+    // Format: "Authorization: Bearer <token>" — used by mobile clients
+    // and service-to-service calls.
     const authHeader = req.headers.authorization;
     if (authHeader && authHeader.startsWith("Bearer ")) {
       accessToken = authHeader.split(" ")[1];
     }
 
-    // 2. Fall back to httpOnly cookie (browser clients)
+    // ============================================
+    // STEP 2: Fall Back to httpOnly Cookie
+    // ============================================
+    // Browser clients that store the token in a cookie instead of
+    // manually attaching an Authorization header.
     if (!accessToken && req.cookies) {
       accessToken = req.cookies.accessToken;
     }
 
+    // ============================================
+    // STEP 3: Reject if No Token Found
+    // ============================================
     if (!accessToken) {
       throw new UnauthorizedError("Authorization token missing");
     }
 
-    // Verify access token
+    // ============================================
+    // STEP 4: Verify Token Signature & Expiry
+    // ============================================
+    // jwt.verify throws TokenExpiredError / JsonWebTokenError on failure,
+    // which are caught below and translated into UnauthorizedError.
     const payload = jwt.verify(
       accessToken,
       config.JWT_ACCESS_SECRET,
     ) as AccessTokenPayload;
 
+    // ============================================
+    // STEP 5: Validate Payload Shape
+    // ============================================
     if (!payload.id) {
       throw new UnauthorizedError("Invalid token payload");
     }
 
-    // Attach user context to request for downstream services
+    // ============================================
+    // STEP 6: Attach User Context to Request
+    // ============================================
+    // Makes req.user.id available to later middlewares in this request
+    // (e.g. userRateLimit() reads req.user.id to key its Redis limit).
     req.user = {
       id: payload.id,
     };
 
-    // Add user ID to headers for proxied requests
+    // ============================================
+    // STEP 7: Forward Identity to Downstream Service
+    // ============================================
+    // The gateway strips its own auth header handling; this custom header
+    // is how the downstream microservice learns who the caller is without
+    // having to verify the JWT itself.
     req.headers["x-user-id"] = payload.id.toString();
 
     logger.debug(`User ${payload.id} authenticated successfully`);
+
+    // ============================================
+    // STEP 8: Continue to Next Middleware/Route
+    // ============================================
     next();
   } catch (err) {
     const error = err as Error;
 
+    // Map specific jsonwebtoken error types to clearer client-facing codes
+    // so the frontend can distinguish "expired, please refresh" from
+    // "invalid, please log in again".
     if (error.name === "TokenExpiredError") {
       return next(
         new UnauthorizedError("Access token expired", "TOKEN_EXPIRED"),
@@ -80,6 +121,8 @@ export function requireAuth(
         new UnauthorizedError("Invalid access token", "TOKEN_INVALID"),
       );
     }
+    // Anything else (e.g. UnauthorizedError thrown above) passes through
+    // to the global error middleware unchanged.
     return next(error);
   }
 }

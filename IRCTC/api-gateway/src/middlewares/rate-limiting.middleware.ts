@@ -1,3 +1,11 @@
+// ============================================
+// Rate Limiting Middleware
+// ============================================
+// All strategies below share the same sliding-window algorithm (rateLimiter())
+// but key it differently — by IP, by authenticated user, or by endpoint+IP.
+// Applied per-route in routes/index.ts, e.g. endpointRateLimit(10, 900000) on
+// login, combinedRateLimit() on the authenticated profile route.
+
 import { Request, Response, NextFunction } from "express";
 import { redis } from "../config/redis";
 import { config } from "../config";
