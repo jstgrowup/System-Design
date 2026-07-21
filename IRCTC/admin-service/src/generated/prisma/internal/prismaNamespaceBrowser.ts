@@ -51,7 +51,12 @@ export const AnyNull = runtime.AnyNull
 
 
 export const ModelName = {
-  User: 'User'
+  Station: 'Station',
+  Train: 'Train',
+  Seat: 'Seat',
+  Route: 'Route',
+  RouteStation: 'RouteStation',
+  Schedule: 'Schedule'
 } as const
 
 export type ModelName = (typeof ModelName)[keyof typeof ModelName]
@@ -70,18 +75,74 @@ export const TransactionIsolationLevel = runtime.makeStrictEnum({
 export type TransactionIsolationLevel = (typeof TransactionIsolationLevel)[keyof typeof TransactionIsolationLevel]
 
 
-export const UserScalarFieldEnum = {
+export const StationScalarFieldEnum = {
   id: 'id',
-  firstName: 'firstName',
-  lastName: 'lastName',
-  email: 'email',
-  password: 'password',
-  emailVerified: 'emailVerified',
+  name: 'name',
+  code: 'code',
+  city: 'city',
+  state: 'state',
   createdAt: 'createdAt',
   updatedAt: 'updatedAt'
 } as const
 
-export type UserScalarFieldEnum = (typeof UserScalarFieldEnum)[keyof typeof UserScalarFieldEnum]
+export type StationScalarFieldEnum = (typeof StationScalarFieldEnum)[keyof typeof StationScalarFieldEnum]
+
+
+export const TrainScalarFieldEnum = {
+  id: 'id',
+  trainNumber: 'trainNumber',
+  trainName: 'trainName',
+  coachName: 'coachName',
+  totalSeats: 'totalSeats',
+  createdAt: 'createdAt',
+  updatedAt: 'updatedAt'
+} as const
+
+export type TrainScalarFieldEnum = (typeof TrainScalarFieldEnum)[keyof typeof TrainScalarFieldEnum]
+
+
+export const SeatScalarFieldEnum = {
+  id: 'id',
+  trainId: 'trainId',
+  seatNumber: 'seatNumber',
+  seatType: 'seatType',
+  price: 'price'
+} as const
+
+export type SeatScalarFieldEnum = (typeof SeatScalarFieldEnum)[keyof typeof SeatScalarFieldEnum]
+
+
+export const RouteScalarFieldEnum = {
+  id: 'id',
+  trainId: 'trainId'
+} as const
+
+export type RouteScalarFieldEnum = (typeof RouteScalarFieldEnum)[keyof typeof RouteScalarFieldEnum]
+
+
+export const RouteStationScalarFieldEnum = {
+  id: 'id',
+  routeId: 'routeId',
+  stationId: 'stationId',
+  sequenceNumber: 'sequenceNumber',
+  arrivalTime: 'arrivalTime',
+  departureTime: 'departureTime',
+  distanceFromOrigin: 'distanceFromOrigin'
+} as const
+
+export type RouteStationScalarFieldEnum = (typeof RouteStationScalarFieldEnum)[keyof typeof RouteStationScalarFieldEnum]
+
+
+export const ScheduleScalarFieldEnum = {
+  id: 'id',
+  trainId: 'trainId',
+  departureDate: 'departureDate',
+  status: 'status',
+  createdAt: 'createdAt',
+  updatedAt: 'updatedAt'
+} as const
+
+export type ScheduleScalarFieldEnum = (typeof ScheduleScalarFieldEnum)[keyof typeof ScheduleScalarFieldEnum]
 
 
 export const SortOrder = {

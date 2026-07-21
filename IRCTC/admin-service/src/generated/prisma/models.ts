@@ -8,5 +8,10 @@
  *
  * 🟢 You can import this file directly.
  */
-export type * from './models/User'
+export type * from './models/Station'
+export type * from './models/Train'
+export type * from './models/Seat'
+export type * from './models/Route'
+export type * from './models/RouteStation'
+export type * from './models/Schedule'
 export type * from './commonInputTypes'
