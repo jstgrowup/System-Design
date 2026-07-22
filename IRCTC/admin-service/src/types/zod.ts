@@ -24,3 +24,36 @@ export const zStation = z.object({
     .optional(),
 });
 export type StationBodyType = z.infer<typeof zStation>;
+export const zSeat = z.object({
+  seatNumber: z
+    .number({ error: "Seat number is required" })
+    .int("Seat number must be a whole number")
+    .positive("Seat number must be greater than 0"),
+  seatType: z.enum(["LOWER", "MIDDLE", "UPPER", "SIDE_LOWER", "SIDE_UPPER"], {
+    error: "Invalid seat type",
+  }),
+  price: z
+    .number({ error: "Price is required" })
+    .positive("Price must be greater than 0"),
+});
+export type SeatBodyType = z.infer<typeof zSeat>;
+
+export const zTrain = z.object({
+  trainNumber: z
+    .string({ error: "Train number is required" })
+    .min(1, "Train number must be at least 1 character")
+    .max(10, "Train number cannot exceed 10 characters")
+    .trim(),
+  trainName: z
+    .string({ error: "Train name is required" })
+    .min(4, "Train name must be at least 4 characters")
+    .max(40, "Train name cannot exceed 40 characters")
+    .trim(),
+  coachName: z
+    .string()
+    .max(20, "Coach name cannot exceed 20 characters")
+    .trim()
+    .optional(),
+  seats: z.array(zSeat).min(1, "At least one seat is required"),
+});
+export type TrainBodyType = z.infer<typeof zTrain>;

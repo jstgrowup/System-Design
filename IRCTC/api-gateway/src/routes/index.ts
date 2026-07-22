@@ -31,8 +31,8 @@ const userServiceProxy = createProxy(
 // Rate limited: 10 requests per 15 minutes per IP (prevents brute force)
 gatewayRouter.post(
   "/users/auth/login",
-  endpointRateLimit(10, 900000),  // 10 requests, 900000ms = 15 minutes
-  userServiceProxy,               // Forward to user service /auth/login
+  endpointRateLimit(10, 900000), // 10 requests, 900000ms = 15 minutes
+  userServiceProxy, // Forward to user service /auth/login
 );
 
 // ============================================
@@ -43,22 +43,31 @@ gatewayRouter.post(
 // Rate limited: Combined IP + user-based (IP: 100/15min, User: 1000/15min)
 gatewayRouter.get(
   "/users/user/profile",
-  requireAuth,              // Check JWT token
-  combinedRateLimit(),      // Apply IP + user rate limiting
-  userServiceProxy,         // Forward to user service /user/profile
+  requireAuth, // Check JWT token
+  combinedRateLimit(), // Apply IP + user rate limiting
+  userServiceProxy, // Forward to user service /user/profile
 );
 
+const adminServiceProxy = createProxy(
+  "adminService",
+  config.SERVICES.ADMIN_SERVICE_URL,
+);
+
+gatewayRouter.get(
+  "/admins/stations/station",
+  requireAuth,
+  combinedRateLimit(),
+  adminServiceProxy,
+);
 // ============================================
 // ROUTE 3: Gateway Health Check
 // ============================================
 // GET /api/gateway/health
 // Returns gateway status (no proxying needed)
 gatewayRouter.get("/gateway/health", (req, res) => {
-  return res
-    .status(200)
-    .json({
-      success: true,
-      message: "Gateway is healthy",
-      timestamp: new Date().toString()
-    });
+  return res.status(200).json({
+    success: true,
+    message: "Gateway is healthy",
+    timestamp: new Date().toString(),
+  });
 });
