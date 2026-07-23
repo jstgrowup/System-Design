@@ -59,6 +59,12 @@ gatewayRouter.get(
   combinedRateLimit(),
   adminServiceProxy,
 );
+gatewayRouter.get(
+  "/admins/trains/train",
+  requireAuth,
+  combinedRateLimit(),
+  adminServiceProxy,
+);
 // ============================================
 // ROUTE 3: Gateway Health Check
 // ============================================

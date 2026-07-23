@@ -57,3 +57,36 @@ export const zTrain = z.object({
   seats: z.array(zSeat).min(1, "At least one seat is required"),
 });
 export type TrainBodyType = z.infer<typeof zTrain>;
+
+export const zRouteStation = z.object({
+  stationId: z.uuid("Station ID must be a valid UUID"),
+  sequenceNumber: z
+    .number({ error: "Sequence number is required" })
+    .int("Sequence number must be a whole number")
+    .positive("Sequence number must be greater than 0"),
+  arrivalTime: z
+    .string()
+    .regex(/^([01]\d|2[0-3]):[0-5]\d$/, "Arrival time must be in HH:mm format")
+    .optional(),
+  departureTime: z
+    .string()
+    .regex(
+      /^([01]\d|2[0-3]):[0-5]\d$/,
+      "Departure time must be in HH:mm format",
+    )
+    .optional(),
+  distanceFromOrigin: z
+    .number({ error: "Distance from origin is required" })
+    .nonnegative("Distance from origin cannot be negative")
+    .optional(),
+});
+export type RouteStationBodyType = z.infer<typeof zRouteStation>;
+
+export const zRoute = z.object({
+  trainId: z.uuid("Train ID must be a valid UUID"),
+  stations: z
+    .array(zRouteStation)
+    .min(2, "A route must have at least 2 stations"),
+});
+
+export type RouteBodyType = z.infer<typeof zRoute>;
