@@ -115,15 +115,34 @@ const createRoute = async ({ trainId, stations }: RouteBodyType) => {
       },
     },
   });
-  const trainWithSeats = await prisma.train.findUnique({
-    where: { id: trainId },
-    include: { seats: { orderBy: { seatNumber: "asc" } } },
-  });
+  // const trainWithSeats = await prisma.train.findUnique({
+  //   where: { id: trainId },
+  //   include: { seats: { orderBy: { seatNumber: "asc" } } },
+  // });
 
-  await adminProducer.publishRouteCreated({
-    ...route,
-    train: trainWithSeats,
-  });
+  // await adminProducer.publishRouteCreated({
+  //   ...route,
+  //   train: trainWithSeats,
+  // });
   return route;
 };
-export const trainService = { createTrain, createRoute };
+
+const getTrainById = async (id: string) => {
+  const train = await prisma.train.findUnique({
+    where: { id },
+    include: {
+      seats: { orderBy: { seatNumber: "asc" } },
+      route: {
+        include: {
+          routeStations: {
+            include: { station: true },
+            orderBy: { sequenceNumber: "asc" },
+          },
+        },
+      },
+    },
+  });
+  if (!train) throw new NotFoundError("Train not found");
+  return train;
+};
+export const trainService = { getTrainById, createTrain, createRoute };

@@ -81,5 +81,17 @@ const createRoute = asyncHandler(
       .json({ success: true, message: "Route created successfully" });
   },
 );
-
-export const trainController = { createTrain };
+const getTrainById = asyncHandler(
+  async (req: Request, res: Response, next: NextFunction) => {
+    const { trainId } = req.params;
+    if (!trainId) {
+      throw new BadRequestError("Train Id is missing");
+    }
+    const train = await trainService.getTrainById(trainId as string);
+    return res.status(200).json({
+      success: true,
+      data: train,
+    });
+  },
+);
+export const trainController = { getTrainById, createTrain, createRoute };

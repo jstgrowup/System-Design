@@ -1,7 +1,14 @@
 import { producer, connectProducer } from "../../config/kafka";
 import logger from "../../config/logger";
 import { KAFKA_TOPICS } from "../../../../shared/constants/kafka-topics";
-import { Station, Train, Route, Schedule } from "../../generated/prisma/client";
+import {
+  Station,
+  Train,
+  Route,
+  Schedule,
+  ScheduleStatus,
+  SeatType,
+} from "../../generated/prisma/client";
 
 interface StationCreatedEvent {
   eventType: "STATION_CREATED";
@@ -13,6 +20,38 @@ interface ScheduleCancelledEvent {
   eventType: "SCHEDULE_CANCELLED";
   data: Schedule;
   timestamp: string;
+}
+
+/**
+ * Denormalized schedule snapshot consumed by inventory-service and
+ * search-service — carries the seat map and route so those services
+ * don't need to call back into admin-service.
+ */
+export interface ScheduleCreatedPayload {
+  scheduleId: string;
+  trainId: string;
+  trainNumber: string;
+  trainName: string;
+  coachName: string;
+  totalSeats: number;
+  departureDate: Date;
+  status: ScheduleStatus;
+  seats: {
+    seatId: string;
+    seatNumber: number;
+    seatType: SeatType;
+    price: number;
+  }[];
+  route: {
+    stationId: string;
+    stationName: string;
+    stationCode: string;
+    city: string;
+    sequenceNumber: number;
+    arrivalTime: string | null;
+    departureTime: string | null;
+    distanceFromOrigin: number;
+  }[];
 }
 
 /**
@@ -123,10 +162,10 @@ class AdminProducer {
   /**
    * Publishes a schedule-created event.
    */
-  async publishScheduleCreated(scheduleData: Schedule) {
-    return this.sendMessage<Schedule>(
+  async publishScheduleCreated(scheduleData: ScheduleCreatedPayload) {
+    return this.sendMessage<ScheduleCreatedPayload>(
       KAFKA_TOPICS.SCHEDULE_CREATED,
-      `schedule-${scheduleData.id}`,
+      `schedule-${scheduleData.scheduleId}`,
       scheduleData,
     );
   }

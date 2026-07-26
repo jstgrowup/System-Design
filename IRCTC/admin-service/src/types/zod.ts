@@ -90,3 +90,10 @@ export const zRoute = z.object({
 });
 
 export type RouteBodyType = z.infer<typeof zRoute>;
+
+export const zSchedule = z.object({
+  trainId: z.uuid("Train ID must be a valid UUID"),
+  departureDate: z.coerce.date({ error: "Departure date is required" }),
+  status: z.enum(["ACTIVE", "CANCELLED"], { error: "Invalid status" }).optional(),
+});
+export type ScheduleBodyType = z.infer<typeof zSchedule>;
