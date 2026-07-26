@@ -10,7 +10,7 @@ When asked to document a service in this repo (e.g. "document the X service", "w
   2. Architecture — one ASCII diagram showing this service's place among the others
   3. File Structure — annotated directory tree
   4. Lifecycle walkthroughs — 2-3 concrete, step-by-step examples of a request/message flowing through the system (happy path, an edge case, a failure path)
-  5. Component Breakdown — one subsection per file/module, with the *actual current* code pasted in (re-read the file, never paraphrase or reconstruct from memory)
+  5. Component Breakdown — one subsection per file/module, with the _actual current_ code pasted in (re-read the file, never paraphrase or reconstruct from memory)
   6. Environment Variables — every var actually read from `process.env`, flagging any that are unused
   7. A reference table for whatever this service's "codes" are (HTTP error codes, Kafka topics, job types, etc.)
   8. Quick Start — commands to install and run it, plus one concrete example request/message
@@ -19,3 +19,32 @@ When asked to document a service in this repo (e.g. "document the X service", "w
 - **Tone**: plain English, one idea per sentence, no unexplained jargon. Explain the "why," not just the "what" — code already shows the what.
 - **Never fix anything while documenting.** Only describe current behavior and list oddities under Known Issues — even obvious bugs. Documentation and code changes are separate tasks unless explicitly asked to fix.
 - Every code snippet must match the current source exactly.
+
+## TypeScript & Type Safety
+
+**Avoid Type Erasure**
+
+- Never use `any` — use `unknown` for unpredictable data and narrow it safely.
+- Avoid `as CustomType` assertions except at external/legacy boundaries.
+- Use type guards (`is` predicates, `in` checks, Zod) for runtime safety.
+- Handle `null`/`undefined` explicitly — never use `!`.
+
+**Design Patterns**
+
+- Model complex UI/state machines with Discriminated Unions.
+- Prefer `readonly` on arrays and properties in pure logic.
+- Use `interface` for structural objects/class APIs; `type` for unions, intersections, and primitives.
+- Use built-in utilities (`Pick`, `Omit`, `Partial`, `ReturnType`) over duplicate types.
+
+**Execution Practices**
+
+- Design types/interfaces _before_ writing logic.
+- Explicitly type function definitions and public API returns — don't rely on inference alone.
+- Co-locate types with the code that uses them; move to `types/` only if 3+ modules share them.
+- Keep helpers localized; use `export type` over full imports to optimize bundling.
+
+## Key constraints
+
+- **Ask before building** — clarify requirements, edge cases, and scope with counter-questions before starting any implementation.
+- **Docs are mandatory** — see Documentation section.
+- **Never run git operations autonomously** — no `git add`, `git commit`, `git push`, or branch creation unless explicitly asked.
