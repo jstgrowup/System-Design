@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import { zTrain } from "../types/zod";
+import { zRoute, zTrain } from "../types/zod";
 import { ErrorResponse } from "../utils/api-response";
 import { formatZodError } from "../utils/zod.formatter";
 
@@ -58,29 +58,27 @@ const createTrain = asyncHandler(
 const createRoute = asyncHandler(
   async (req: Request, res: Response, next: NextFunction) => {
     // Validate incoming body against the zTrain schema
-    const result = zTrain.safeParse(req.body);
+    const result = zRoute.safeParse(req.body);
     if (!result.success) {
       return ErrorResponse(res, 400, {
         message: formatZodError(result.error),
       });
     }
 
-    const { trainName, trainNumber, coachName, seats } = result.data;
+    const { stations, trainId } = result.data;
     // Redundant with zTrain's own `.min(1, ...)` on `seats`, kept as a defensive check
-    if (seats.length === 0) {
-      throw new BadRequestError("Atleast one seat must be defined");
+    if (stations.length === 0) {
+      throw new BadRequestError("A route must have at least 2 stations");
     }
 
-    await trainService.createTrain({
-      trainName,
-      trainNumber,
-      coachName,
-      seats,
+    await trainService.createRoute({
+      stations,
+      trainId,
     });
 
     res
       .status(200)
-      .json({ success: true, message: "Train created successfully" });
+      .json({ success: true, message: "Route created successfully" });
   },
 );
 
