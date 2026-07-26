@@ -1,7 +1,7 @@
 import prisma from "../config/prisma";
 import { ConflictError } from "../utils/error";
 import logger from "../config/logger";
-import { StationBodyType, TrainBodyType } from "../types/zod";
+import { StationBodyType } from "../types/zod";
 import adminProducer from "../kafka/producer/admin.producer";
 
 /**

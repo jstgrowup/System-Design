@@ -55,9 +55,29 @@ const createTrain = asyncHandler(
       .json({ success: true, message: "Train created successfully" });
   },
 );
+/**
+ * POST /trains/route
+ *
+ * Defines the stop-by-stop route for an existing train. Expects a JSON
+ * body matching `zRoute`: { trainId, stations[] }, where each station is
+ * { stationId, sequenceNumber, arrivalTime?, departureTime?,
+ * distanceFromOrigin? } (see zRouteStation). A train can only have one
+ * route (`Route.trainId` is unique in the schema).
+ *
+ * Flow (see trainService.createRoute for the actual checks):
+ *  1. Validate the body with zRoute — on failure, respond 400.
+ *  2. Defensive re-check that at least one station was supplied (zRoute's
+ *     own `.min(2, ...)` on `stations` already guarantees at least two, so
+ *     this branch is unreachable; the message below still says "2
+ *     stations" even though the check itself is `=== 0`).
+ *  3. Await trainService.createRoute, which validates the train and
+ *     station ids exist and that sequence numbers are contiguous from 1,
+ *     then creates the route + its stations in one transaction.
+ *  4. Respond 200.
+ */
 const createRoute = asyncHandler(
   async (req: Request, res: Response, next: NextFunction) => {
-    // Validate incoming body against the zTrain schema
+    // Validate incoming body against the zRoute schema
     const result = zRoute.safeParse(req.body);
     if (!result.success) {
       return ErrorResponse(res, 400, {
@@ -66,7 +86,7 @@ const createRoute = asyncHandler(
     }
 
     const { stations, trainId } = result.data;
-    // Redundant with zTrain's own `.min(1, ...)` on `seats`, kept as a defensive check
+    // Redundant with zRoute's own `.min(2, ...)` on `stations`, kept as a defensive check
     if (stations.length === 0) {
       throw new BadRequestError("A route must have at least 2 stations");
     }
@@ -81,6 +101,21 @@ const createRoute = asyncHandler(
       .json({ success: true, message: "Route created successfully" });
   },
 );
+/**
+ * POST /trains/route/:id
+ *
+ * Fetches a single train by id, including its seats (ordered by
+ * seatNumber) and its route (ordered by sequenceNumber, each stop
+ * including the full station record).
+ *
+ * Two bugs make this endpoint unusable as currently routed
+ * (see `train.routes.ts`):
+ *  - it's mounted as `POST`, not `GET`, despite being a pure read;
+ *  - the route param is named `:id`, but this handler reads
+ *    `req.params.trainId` — always `undefined` — so every request to
+ *    this path 400s with "Train Id is missing" before `trainService
+ *    .getTrainById` is ever called.
+ */
 const getTrainById = asyncHandler(
   async (req: Request, res: Response, next: NextFunction) => {
     const { trainId } = req.params;

@@ -1,25 +1,31 @@
 import prisma from "../config/prisma";
-import { BadRequestError, ConflictError, NotFoundError } from "../utils/error";
-import logger from "../config/logger";
-import { RouteBodyType, ScheduleBodyType, TrainBodyType } from "../types/zod";
+import { BadRequestError, ConflictError } from "../utils/error";
+import { ScheduleBodyType } from "../types/zod";
 import adminProducer from "../kafka/producer/admin.producer";
 
 /**
- * Creates a new train along with its seat map.
+ * Creates a schedule — a specific departureDate run of an existing train
+ * that already has a route defined.
  *
  * Steps:
- *  1. Look up an existing train by `trainNumber` (the unique identifier)
- *     and throw ConflictError if one is found, so callers get a clean 409
- *     instead of a raw Prisma unique-constraint error.
- *  2. Reject the payload if two seats share the same `seatNumber`.
- *  3. Create the train row and all seat rows in a single Prisma nested
- *     write (one transaction) — `totalSeats` is derived from the payload
- *     length rather than counted separately after insert.
- *  4. Publish a TRAIN_CREATED event on Kafka; unlike stationService,
- *     failures here are caught and logged rather than re-thrown, so a
- *     Kafka outage doesn't turn a successful train creation into a 500.
+ *  1. Look up the train by id (with its seats and full route+stations
+ *     included), 409/400 if it doesn't exist, has no seats, or has no
+ *     route yet — a schedule can't be built without those.
+ *  2. Parse and validate `departureDate`.
+ *  3. Reject a duplicate schedule for the same (trainId, departureDate)
+ *     pair (`Schedule` has a compound unique constraint on those two
+ *     columns).
+ *  4. Create the schedule row.
+ *  5. Build a denormalized event payload — train info, the full seat map,
+ *     and the full route with station details all inlined — so that
+ *     inventory-service and search-service don't need to call back into
+ *     admin-service just to react to a new schedule.
+ *  6. Publish it as a SCHEDULE_CREATED Kafka event.
  *
- * Returns the created train with its seats, ordered by seatNumber.
+ * Note: as of this writing, nothing calls this function via HTTP —
+ * `schedule.route.ts` defines the route but `server.ts` never mounts it
+ * (see that file's comment), so this only runs if invoked directly (e.g.
+ * from a test).
  */
 const createSchedule = async ({ trainId, departureDate }: ScheduleBodyType) => {
   // Train number is the unique identifier — reject duplicates before hitting the DB constraint

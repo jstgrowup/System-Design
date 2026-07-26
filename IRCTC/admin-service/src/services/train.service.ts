@@ -66,14 +66,45 @@ const createTrain = async ({
 
   return train;
 };
+/**
+ * Defines the route (ordered list of stations) for an existing train.
+ *
+ * Steps:
+ *  1. Look up the train by id, 404 if it doesn't exist.
+ *  2. Look up whether a route already exists for this train (`Route.trainId`
+ *     is unique — a train can have at most one route).
+ *
+ *     BUG: the check below is inverted. It reads `if (!existingRoute)` —
+ *     i.e. "no route found yet" — and throws "Route already existis for
+ *     this train" in exactly that case. The intended check was almost
+ *     certainly `if (existingRoute) throw new ConflictError(...)`. As
+ *     written, every train's *first* route creation fails with a
+ *     misleading "already exists" error, and if a route already does
+ *     exist, execution instead falls through to `prisma.route.create`
+ *     below, which would then throw a raw Prisma unique-constraint error
+ *     on `Route.trainId` rather than a clean `ConflictError`.
+ *  3. Validate every `stationId` in the payload actually exists.
+ *  4. Validate `sequenceNumber`s are contiguous starting at 1 (sorted
+ *     copy, checked index-by-index — doesn't mutate the original order
+ *     used for the actual insert below).
+ *  5. Create the route and all its `RouteStation` rows in one nested
+ *     Prisma write, defaulting `arrivalTime`/`departureTime` to null and
+ *     `distanceFromOrigin` to 0 when omitted.
+ *
+ * A ROUTE_CREATED Kafka publish was evidently planned (see the commented-
+ * out block below, right after the `prisma.route.create` call) but is not
+ * currently wired up — `adminProducer.publishRouteCreated` exists and is
+ * fully implemented, but nothing calls it.
+ */
 const createRoute = async ({ trainId, stations }: RouteBodyType) => {
-  // Train number is the unique identifier — reject duplicates before hitting the DB constraint
+  // Train must already exist — a route can't be attached to a train that isn't there
   const existingTrain = await prisma.train.findUnique({
     where: { id: trainId },
   });
   if (!existingTrain) {
     throw new NotFoundError("Train Not found");
   }
+  // See the bug note above the function: this check is inverted.
   const existingRoute = await prisma.route.findUnique({ where: { trainId } });
   if (!existingRoute) {
     throw new NotFoundError("Route already existis for this train");
@@ -115,6 +146,10 @@ const createRoute = async ({ trainId, stations }: RouteBodyType) => {
       },
     },
   });
+  // Commented out — a ROUTE_CREATED publish was started but never finished.
+  // adminProducer.publishRouteCreated (see admin.producer.ts) still expects
+  // a plain Prisma `Route`, not a `{ ...route, train }` shape, so this
+  // wouldn't type-check as-is even if uncommented.
   // const trainWithSeats = await prisma.train.findUnique({
   //   where: { id: trainId },
   //   include: { seats: { orderBy: { seatNumber: "asc" } } },
@@ -127,6 +162,11 @@ const createRoute = async ({ trainId, stations }: RouteBodyType) => {
   return route;
 };
 
+/**
+ * Fetches a single train by id with its seats (ordered by seatNumber) and
+ * its full route (ordered by sequenceNumber, each stop including the
+ * related Station row). Throws NotFoundError if no train has that id.
+ */
 const getTrainById = async (id: string) => {
   const train = await prisma.train.findUnique({
     where: { id },

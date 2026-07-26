@@ -58,6 +58,15 @@ export interface ScheduleCreatedPayload {
  * Wraps the shared Kafka producer with domain-specific helpers for
  * admin-related events (station/train/route/schedule lifecycle).
  * Lazily connects the producer on first use rather than at import time.
+ *
+ * Only publishStationCreated (station.service.ts) and publishTrainCreated
+ * (train.service.ts) are actually reached today. publishRouteCreated is
+ * fully implemented but the call site in train.service.ts's createRoute is
+ * commented out. publishScheduleCreated takes the denormalized
+ * ScheduleCreatedPayload above (not a raw Prisma Schedule row) and is
+ * called from schedule.service.ts — but that service is itself unreachable
+ * via HTTP because schedule.route.ts is never mounted in server.ts.
+ * publishScheduleCancelled has no caller anywhere in this codebase.
  */
 class AdminProducer {
   private isInitialized: boolean;
