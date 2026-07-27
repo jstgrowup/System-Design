@@ -1,7 +1,7 @@
 import { Request, Response, NextFunction } from "express";
 import { zSearchTrains } from "../types/zod";
 import asyncHandler from "../utils/asyncHandler";
-import searchService from "../services/search.service";
+import searchService from "../services/inventory.service";
 import { ErrorResponse } from "../utils/api-response";
 import { formatZodError } from "../utils/zod.formatter";
 

@@ -60,7 +60,12 @@ export interface ScheduleCreatedEvent {
   trainId: string;
   departureDate: string;
   status: string;
-  seats?: { seatId: string; seatNumber: number; seatType: string; price: number }[];
+  seats?: {
+    seatId: string;
+    seatNumber: number;
+    seatType: string;
+    price: number;
+  }[];
 }
 
 /**
