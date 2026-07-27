@@ -1,5 +1,5 @@
 import { Request, Response, NextFunction } from "express";
-import { stationService } from "../services/station.service";
+import { inventoryService } from "../services/inventory.service";
 import { zStation } from "../types/zod";
 import { ErrorResponse } from "../utils/api-response";
 import { formatZodError } from "../utils/zod.formatter";
@@ -44,12 +44,7 @@ const createStation = asyncHandler(
     // before the DB write / Kafka publish settle, and a rejection here
     // (e.g. ConflictError on a duplicate code) becomes an unhandled
     // promise rejection instead of reaching errorHandler.
-    const station = stationService.createStation({
-      code: code.toUpperCase(),
-      name,
-      city,
-      state,
-    });
+    const station = inventoryService.initializeInventory();
 
     // Message text is a holdover from a different (OTP-based) flow.
     res.status(200).json({ success: true, message: "OTP sent successfully" });
