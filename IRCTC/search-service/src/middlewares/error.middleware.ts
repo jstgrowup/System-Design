@@ -36,8 +36,8 @@ export const errorMiddleware = (
     // - ServiceUnavailableError (503)
     res.status(err.statusCode).json({
       success: false,
-      error: err.code,           // Machine-readable error code
-      message: err.message,      // Human-readable message
+      error: err.code, // Machine-readable error code
+      message: err.message, // Human-readable message
     });
     return;
   }
@@ -51,11 +51,11 @@ export const errorMiddleware = (
   if (config.NODE_ENV !== "production") {
     logger.error({
       message: err.message,
-      stack: err.stack,            // Stack trace for debugging
-      path: req.path,              // Request path
-      method: req.method,          // HTTP method
-      body: req.body,              // Request body (might reveal issue)
-      query: req.query,            // Query parameters
+      stack: err.stack, // Stack trace for debugging
+      path: req.path, // Request path
+      method: req.method, // HTTP method
+      body: req.body, // Request body (might reveal issue)
+      query: req.query, // Query parameters
     });
   }
 

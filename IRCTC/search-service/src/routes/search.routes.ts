@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { scheduleController } from "../controllers/schedule.controller";
+import { searchController } from "../controllers/search.controller";
 
 const router = Router();
 
@@ -9,6 +9,14 @@ const router = Router();
 // .createSchedule — the whole schedule-creation feature is dead code from
 // the outside, reachable only by importing this router directly (e.g. in
 // a test) rather than through the running server.
-router.post("/schedule", scheduleController.createSchedule);
+// GET /search/trains?from=Delhi&to=Mumbai&date=2025-07-15
+router.get("/trains", searchController.searchTrains);
+
+// GET /search/autocomplete?q=del
+router.get("/autocomplete", searchController.autoComplete);
+
+// Debug endpoints
+router.get("/debug/stations", searchController.debugStations);
+router.get("/debug/trains", searchController.debugTrains);
 
 export default router;

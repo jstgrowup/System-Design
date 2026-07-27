@@ -1,10 +1,9 @@
 import { Request, Response, NextFunction } from "express";
-import { zSchedule, zSearchTrains } from "../types/zod";
+import { zSearchTrains } from "../types/zod";
+import asyncHandler from "../utils/asyncHandler";
+import searchService from "../services/search.service";
 import { ErrorResponse } from "../utils/api-response";
 import { formatZodError } from "../utils/zod.formatter";
-import asyncHandler from "../utils/asyncHandler";
-import { scheduleService } from "../services/schedule.service";
-import searchService from "../services/search.service";
 
 /**
  * POST /schedule (defined in schedule.route.ts — see that file for why
@@ -26,7 +25,7 @@ import searchService from "../services/search.service";
  *     successfully") is a copy-paste leftover from train.controller.ts —
  *     it describes the wrong resource.
  */
-const createTrains = asyncHandler(
+const searchTrains = asyncHandler(
   async (req: Request, res: Response, next: NextFunction) => {
     // Validate incoming body against the zSchedule schema
     const result = zSearchTrains.safeParse(req.query);
@@ -37,11 +36,46 @@ const createTrains = asyncHandler(
     }
 
     const { from, to, date } = result.data;
-    await searchService.searchTrains({ from, to, date });
+    const response = await searchService.searchTrains({ from, to, date });
+
     return res
       .status(200)
       .json({ success: true, message: "Train created successfully" });
   },
 );
+const autoComplete = asyncHandler(
+  async (req: Request, res: Response, next: NextFunction) => {
+    // Validate incoming body against the zSchedule schema
+    const { q } = req.query;
 
-export const searchController = { createTrains };
+    const response = await searchService.autocompleteStation(q as string);
+
+    return res.status(200).json({ success: true, data: response });
+  },
+);
+const debugStations = asyncHandler(
+  async (req: Request, res: Response, next: NextFunction) => {
+    // Validate incoming body against the zSchedule schema
+    const { q } = req.query;
+
+    const response = await searchService.autocompleteStation(q as string);
+
+    return res.status(200).json({ success: true, data: response });
+  },
+);
+const debugTrains = asyncHandler(
+  async (req: Request, res: Response, next: NextFunction) => {
+    // Validate incoming body against the zSchedule schema
+    const { q } = req.query;
+
+    const response = await searchService.autocompleteStation(q as string);
+
+    return res.status(200).json({ success: true, data: response });
+  },
+);
+export const searchController = {
+  searchTrains,
+  autoComplete,
+  debugStations,
+  debugTrains,
+};

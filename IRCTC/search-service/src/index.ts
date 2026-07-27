@@ -6,14 +6,12 @@ import helmet from "helmet";
 import { config } from "./config";
 import logger from "./config/logger";
 import { initIndices, recreateIndices } from "./config/elasticsearch";
-
 import { corsMiddleware } from "./middlewares/cors.middleware";
-import errorHandler from "./middlewares/error.middleware";
 import { reqLogger } from "./middlewares/req.middleware";
-
-import searchRoutes from "./routes/search.route";
+import searchRoutes from "./routes/search.routes";
 import searchConsumer from "./kafka/search.service";
 import { disconnectAll } from "./config/kafka";
+import { errorMiddleware } from "./middlewares/error.middleware";
 
 const app = express();
 
@@ -46,7 +44,7 @@ app.use(searchRoutes);
 app.get("/health", (req: Request, res: Response) =>
   res.json({ status: "ok", service: config.SERVICE_NAME }),
 );
-app.use(errorHandler);
+app.use(errorMiddleware);
 
 const startServer = async (): Promise<void> => {
   if (process.env.ES_RECREATE_INDICES === "true") {
