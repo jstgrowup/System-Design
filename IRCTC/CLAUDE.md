@@ -29,6 +29,17 @@ When asked to document a service in this repo (e.g. "document the X service", "w
 - Keep the same tone and format already established there: plain language, diagrams (Mermaid) over prose where possible, and honest about what currently works vs. what doesn't.
 - This is separate from the per-service `docs/README.md` convention below — the root README is the high-level map; per-service docs are the deep dive.
 
+## Global Context Docs Maintenance
+
+`docs/implementation-plan.md` and `docs/api-contract.md` (at the repo root, not per-service) exist so a fresh Claude session gets full system context without re-reading every service. `implementation-plan.md` is the current-state architecture narrative (what's built, what's broken, why); `api-contract.md` is the as-is HTTP + Kafka reference (every route/topic, its exact request/response shape, and a status tag: WORKING / BROKEN / UNREACHABLE / STUBBED / NEVER FIRES / SILENTLY NO-OPS). Keep both in sync with reality as part of the same change that alters what they describe — don't leave this for a separate documentation pass:
+
+- **Update `api-contract.md`** whenever a change adds, removes, or changes the behavior of an HTTP route or Kafka topic — new endpoint, changed request/response shape, a route that starts/stops being reachable, a bug that's fixed or newly introduced, a new service. Update the specific route/topic entry, its status tag, and the Kafka topic matrix row if a producer/consumer relationship changed.
+- **Update `implementation-plan.md`** whenever a change affects the architecture-level picture — a service's build/runtime status flips (e.g. it now compiles, or newly doesn't), a new service is added, a cross-service flow changes, or an item in the tiered "why nothing works end-to-end" list is resolved or newly introduced. Update the relevant per-service notes section, the services-at-a-glance table, and the tiered issue list.
+- **Don't re-run a full audit for a small change.** Make the targeted edit to the section(s) affected — these files were originally built via a full-repo audit, but day-to-day maintenance should be incremental.
+- **Trigger threshold**: contract/architecture-affecting changes only (new/changed/removed route or topic, new service, data-model change, a status flip). Internal refactors, formatting, or comment-only changes with no observable behavior difference don't require touching these files.
+- **Also check `README.md`** per the Root README Maintenance rule above — a change significant enough to affect these two files is often significant enough to affect the root README too, but not always; use that section's own criteria to decide.
+- Same non-negotiables as the per-service convention: describe current behavior exactly, including bugs — don't silently fix something while updating its doc entry — and never invent a code snippet or shape from memory; re-read the actual current source first.
+
 ## TypeScript & Type Safety
 
 **Avoid Type Erasure**
