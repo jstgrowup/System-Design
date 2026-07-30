@@ -7,101 +7,122 @@ datasource db {
   provider = "postgresql"
 }
 
-model Station {
-  id        String   @id @default(uuid())
-  name      String   @unique // "New Delhi"
-  code      String   @unique // "NDLS"
-  city      String // "Delhi"
-  state     String?
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  routeStations RouteStation[]
-
-  @@index([name])
-  @@index([code])
-  @@map("stations")
-}
-
-model Train {
-  id          String   @id @default(uuid())
-  trainNumber String   @unique // "12301"
-  trainName   String // "Rajdhani Express"
-  coachName   String   @default("AC") // Single coach per train (simplified)
-  totalSeats  Int // Total seats in the single coach
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
-
-  seats     Seat[]
-  route     Route? 
-  schedules Schedule[]
-
-  @@map("trains")
-}
-
-enum SeatType { 
-  LOWER
-  MIDDLE
-  UPPER
-  SIDE_LOWER
-  SIDE_UPPER
-}
-
-model Seat {
-  id         String   @id @default(uuid())
-  trainId    String
-  seatNumber Int // 1, 2, 3...
-  seatType   SeatType // LOWER, MIDDLE, UPPER etc
-  price      Float // Price for this seat type
-
-  train Train @relation(fields: [trainId], references: [id], onDelete: Cascade)
-
-  @@unique([trainId, seatNumber])
-  @@map("seats")
-}
-
-model Route {
-  id      String @id @default(uuid())
-  trainId String @unique
-
-  train         Train          @relation(fields: [trainId], references: [id], onDelete: Cascade)
-  routeStations RouteStation[]
-
-  @@map("routes")
-}
-
-model RouteStation {
-  id                 String  @id @default(uuid())
-  routeId            String
-  stationId          String
-  sequenceNumber     Int // 1, 2, 3... order of station in route
-  arrivalTime        String? // "06:00"
-  departureTime      String? // "06:10" (null for last station)
-  distanceFromOrigin Float   @default(0) // in km, for pricing calculation
-
-  route   Route   @relation(fields: [routeId], references: [id], onDelete: Cascade)
-  station Station @relation(fields: [stationId], references: [id], onDelete: Cascade)
-
-  @@unique([routeId, sequenceNumber])
-  @@unique([routeId, stationId])
-  @@map("route_stations")
-}
-
-model Schedule {
-  id            String         @id @default(uuid())
-  trainId       String
-  departureDate DateTime       @db.Date // The date this train runs
-  status        ScheduleStatus @default(ACTIVE)
-  createdAt     DateTime       @default(now())
-  updatedAt     DateTime       @updatedAt
-
-  train Train @relation(fields: [trainId], references: [id], onDelete: Cascade)
-
-  @@unique([trainId, departureDate])
-  @@map("schedules")
-}
-
-enum ScheduleStatus {
-  ACTIVE
+enum SeatStatus {
+  AVAILABLE
+  LOCKED
+  BOOKED
   CANCELLED
+}
+
+// One row per (trainId, departureDate) schedule fanned out from
+// admin-service's admin.schedule-created event. Aggregate seat counters
+// (available/locked/booked) are recomputed from SeatInventory rather than
+// trusted as a running total, to avoid counter drift under concurrent writes.
+model ScheduleInventory {
+  id            String   @id @default(uuid())
+  scheduleId    String   @unique
+  trainId       String
+  trainNumber   String
+  trainName     String
+  departureDate DateTime @db.Date
+  totalSeats    Int
+  available     Int
+  locked        Int      @default(0)
+  booked        Int      @default(0)
+  status        String   @default("ACTIVE")
+  version       Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  seats SeatInventory[]
+
+  @@index([trainId])
+  @@index([scheduleId, status])
+  @@index([departureDate])
+  @@map("schedule_inventories")
+}
+
+// One row per physical seat per schedule. `status` is the seat's summary
+// status across the whole journey; segment-level (partial-journey) locks
+// live in SeatSegmentLock instead and get reconciled into this row's status
+// by recomputeSegmentSeatStatuses.
+model SeatInventory {
+  id                  String     @id @default(uuid())
+  scheduleInventoryId String
+  scheduleId          String
+  seatId              String
+  seatNumber          Int
+  seatType            String
+  price               Float
+  status              SeatStatus @default(AVAILABLE)
+  lockedBy            String?
+  lockedAt            DateTime?
+  lockExpiresAt       DateTime?
+  bookingId           String?
+  version             Int        @default(0)
+  createdAt           DateTime   @default(now())
+  updatedAt           DateTime   @updatedAt
+
+  scheduleInventory ScheduleInventory @relation(fields: [scheduleInventoryId], references: [id], onDelete: Cascade)
+
+  @@unique([scheduleId, seatId])
+  @@unique([scheduleId, seatNumber])
+  @@index([scheduleId, status])
+  @@index([lockExpiresAt, status])
+  @@index([bookingId])
+  @@map("seat_inventories")
+}
+
+// Ordered station list per schedule, populated from the same
+// SCHEDULE_CREATED event's denormalized route. Used to resolve a station ID
+// to its sequence number for segment-overlap checks (see SeatSegmentLock).
+model RouteStop {
+  id             String @id @default(uuid())
+  scheduleId     String
+  stationId      String
+  stationName    String
+  stationCode    String
+  sequenceNumber Int
+
+  @@unique([scheduleId, stationId])
+  @@unique([scheduleId, sequenceNumber])
+  @@index([scheduleId])
+  @@map("route_stops")
+}
+
+// One row per seat locked/booked for a specific journey segment
+// [fromSeq, toSeq). Two segments overlap when a.fromSeq < b.toSeq AND
+// b.fromSeq < a.toSeq — this is what lets two passengers hold the same
+// physical seat for non-overlapping parts of a train's route.
+model SeatSegmentLock {
+  id            String     @id @default(uuid())
+  scheduleId    String
+  seatId        String
+  fromSeq       Int
+  toSeq         Int
+  status        SeatStatus @default(LOCKED)
+  lockedBy      String?
+  lockedAt      DateTime?
+  lockExpiresAt DateTime?
+  bookingId     String?
+  version       Int        @default(0)
+  createdAt     DateTime   @default(now())
+  updatedAt     DateTime   @updatedAt
+
+  @@index([scheduleId, seatId])
+  @@index([scheduleId, seatId, status])
+  @@index([lockExpiresAt, status])
+  @@index([bookingId])
+  @@map("seat_segment_locks")
+}
+
+// Guards Kafka consumer handlers (initializeInventory, cancelScheduleInventory)
+// against reprocessing the same event twice on redelivery.
+model IdempotencyRecord {
+  id          String   @id @default(uuid())
+  eventKey    String   @unique
+  processedAt DateTime @default(now())
+
+  @@index([eventKey])
+  @@map("idempotency_records")
 }

@@ -20,10 +20,6 @@ import asyncHandler from "../utils/asyncHandler";
  *     for a duplicate station code, inserts the row, and publishes a
  *     STATION_CREATED Kafka event.
  *  3. Respond 200.
- *
- * Errors the service throws (e.g. ConflictError on a duplicate code) are
- * normally caught by asyncHandler and forwarded to errorHandler — see the
- * note below on why that doesn't reliably happen here.
  */
 const createStation = asyncHandler(
   async (req: Request, res: Response, next: NextFunction) => {
@@ -37,22 +33,20 @@ const createStation = asyncHandler(
 
     const { name, code, city, state } = result.data;
 
-    // Note: not awaited. zStation's `code` field already applies
-    // `.toUpperCase()`, so this second `.toUpperCase()` is a no-op on an
-    // already-uppercased value. More importantly, since the returned
-    // promise is neither awaited nor returned, the response below fires
-    // before the DB write / Kafka publish settle, and a rejection here
-    // (e.g. ConflictError on a duplicate code) becomes an unhandled
-    // promise rejection instead of reaching errorHandler.
-    const station = stationService.createStation({
-      code: code.toUpperCase(),
+    // zStation's `code` field already applies `.toUpperCase()` via zod, so
+    // this call passes it straight through rather than re-uppercasing.
+    const station = await stationService.createStation({
+      code,
       name,
       city,
       state,
     });
 
-    // Message text is a holdover from a different (OTP-based) flow.
-    res.status(200).json({ success: true, message: "OTP sent successfully" });
+    res.status(200).json({
+      success: true,
+      message: "Station created successfully",
+      data: station,
+    });
   },
 );
 

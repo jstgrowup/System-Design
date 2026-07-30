@@ -10,11 +10,11 @@ Single source of truth for the IRCTC Admin Service: what it does, how a request 
 5. [Component Breakdown](#component-breakdown)
    - [index.ts — Entry Point](#1-indexts--entry-point)
    - [server.ts — The Express App](#2-serverts--the-express-app)
-   - [config/ — Kafka, Logger, Prisma](#3-config--kafka-logger-prisma)
-   - [types/ — Validation Schemas & a Stray Type File](#4-types--validation-schemas--a-stray-type-file)
+   - [config/ — Env, Kafka, Logger, Prisma](#3-config--env-kafka-logger-prisma)
+   - [types/ — Validation Schemas & Express Augmentation](#4-types--validation-schemas--express-augmentation)
    - [Station Creation — controller + service](#5-station-creation--controller--service)
    - [Train & Route — controller + service](#6-train--route--controller--service)
-   - [Schedule — controller + service (unmounted)](#7-schedule--controller--service-unmounted)
+   - [Schedule — controller + service](#7-schedule--controller--service)
    - [kafka/producer/admin.producer.ts — Event Publishing](#8-kafkaproduceradminproducerts--event-publishing)
    - [middlewares/ & utils/ — Cross-Cutting Helpers](#9-middlewares--utils--cross-cutting-helpers)
 6. [Environment Variables](#environment-variables)
@@ -32,16 +32,17 @@ The **Admin Service** is the internal API for setting up the data the rest of IR
 
 - **Creates stations** (`POST /stations/station`) — name, code, city, optional state
 - **Creates trains** (`POST /trains/train`) — train number, name, coach, and a full seat map in one call
-- **Defines a train's route** (`POST /trains/route`) — an ordered list of stations with arrival/departure times and distances
-- **Creates schedules** (`schedule.service.ts` / `schedule.controller.ts`) — a specific `departureDate` run of a train that already has a route, denormalized with train + seats + route into a single Kafka event — but this is currently **unreachable over HTTP**, see below
-- Has one read endpoint, `getTrainById`, but it's routed and implemented in a way that makes it **always fail** — see below
+- **Defines a train's route** (`POST /trains/route`) — an ordered list of stations with arrival/departure times and distances. This now correctly succeeds for a brand-new train (a previously-inverted existence check is fixed — see [Request Lifecycle](#request-lifecycle))
+- **Creates schedules** (`POST /schedules/schedule`) — a specific `departureDate` run of a train that already has a route, denormalized with train + seats + route into a single Kafka event. This router is now mounted in `server.ts` and reachable over HTTP (it previously wasn't)
+- **Reads a train by id** (`GET /trains/train/:trainId`) — now correctly routed and reachable (it previously always 400'd — see below)
 - **Validates** every request body with Zod before touching the database
 - **Persists** through Prisma into Postgres (`stations`, `trains`, `seats`, `routes`, `route_stations`, `schedules`)
-- **Publishes Kafka events** so other services (inventory, search) can react — but only two of the five defined publish methods are ever actually reached (see [Kafka Topics Reference](#kafka-topics-reference))
+- **Publishes Kafka events** so other services (inventory, search) can react — all four creation events (`admin.station-created`, `admin.train-created`, `admin.route-created`, `admin.schedule-created`) now actually fire; `admin.schedule-cancelled` still never fires, because there's no cancel-schedule feature built (see [Kafka Topics Reference](#kafka-topics-reference))
+- **Requires a user context on every route** — `getUserContext` middleware (reading an `x-user-id` header) is now mounted on all station, train, and schedule routes. This service was previously running with zero auth wired up anywhere.
 
-There's no update or delete endpoint for any resource, and no working read endpoint either.
+There's still no update or delete endpoint for any resource, and no read/list endpoint for stations, routes, or schedules — `getTrainById` is the only working read path in the service.
 
-**Important:** as currently checked in, this service does not compile. `src/index.ts` and every file under `src/config/` (plus `middlewares/cors.middleware.ts`) import a `config` module (`./config`, `../config`, `.`, `./index` — all pointing at `src/config/index.ts`) that doesn't exist in this project, and `index.ts` also imports a `./config/db` that doesn't exist either. `middlewares/user-context.middleware.ts` also fails to type-check on its own (see [Known Issues #3](#known-issues--inconsistencies)). Running `npx tsc --noEmit` from `admin-service/` confirms this with the same seven errors documented below. Everything described in this doc is what the code is written to do — see [Known Issues](#known-issues--inconsistencies) for the specifics of why it can't do all of it yet.
+**Important:** as of this pass, the service type-checks cleanly. `npx tsc --noEmit` from `admin-service/` reports zero errors — the `config` module that used to be missing now exists (`src/config/index.ts`), the dead `./config/db` import is gone, and `middlewares/user-context.middleware.ts`'s `req.user` assignment now type-checks against a new `types/express.d.ts` augmentation. That said, **this has only been verified statically** — no Postgres instance or Kafka broker was reachable in the environment this fix pass ran in, so none of the flows described below have been exercised against a live database or broker. Treat "works when called" claims in this document as "the logic reads correctly and the types check," not as confirmed runtime behavior. See [Known Issues](#known-issues--inconsistencies) for what's still actually broken or missing.
 
 ---
 
@@ -53,16 +54,20 @@ There's no update or delete endpoint for any resource, and no working read endpo
 │  Proxies (per api-gateway/src/routes/index.ts):                │
 │   GET /admins/stations/station  → adminServiceProxy            │
 │   GET /admins/trains/train      → adminServiceProxy            │
-│  (both registered as GET — admin-service only defines POST     │
-│  for these paths, so requests routed through the gateway to    │
-│  either endpoint 404 today — see Known Issue #12)              │
+│  (both still registered as GET — admin-service only defines    │
+│  POST for these paths, so requests routed through the gateway  │
+│  to either endpoint still 404 today — unchanged by this pass,  │
+│  see Known Issue #4. api-gateway's requireAuth does correctly  │
+│  set x-user-id before proxying, though, so once/if the verb    │
+│  mismatch is fixed, admin-service's auth requirement below     │
+│  would already be satisfied for gateway-routed traffic)        │
 └───────────────────────────┬───────────────────────────────────┘
                             │ HTTP → ADMIN_SERVICE_URL (default
                             │ http://localhost:4003, per the
                             │ gateway's own config)
                             ▼
 ┌───────────────────────────────────────────────────────────────┐
-│                       ADMIN SERVICE                            │
+│                       ADMIN SERVICE (:4003)                    │
 │                                                                 │
 │  server.ts (Express app):                                      │
 │   1. helmet()          → security headers                      │
@@ -70,20 +75,21 @@ There's no update or delete endpoint for any resource, and no working read endpo
 │   3. reqLogger         → logs method/path/status/duration      │
 │   4. cookieParser()                                             │
 │   5. express.json()                                             │
-│   6. /stations → station.route.ts → stationController          │
+│   6. /stations → station.route.ts → getUserContext → stationController│
 │         POST /station                                           │
-│   7. /trains    → train.routes.ts  → trainController            │
-│         POST /train                                             │
-│         POST /route                                             │
-│         POST /route/:id  (broken — see Known Issue #13)         │
-│   8. errorHandler (registered last)                             │
+│   7. /trains    → train.routes.ts  → getUserContext → trainController │
+│         POST /train                                              │
+│         POST /route                                              │
+│         GET  /train/:trainId  (now correctly wired)              │
+│   8. /schedules → schedule.route.ts → getUserContext →           │
+│         scheduleController                                       │
+│         POST /schedule   (newly mounted — was dead code before)  │
+│   9. errorHandler (registered last)                              │
 │                                                                 │
-│  schedule.route.ts (POST /schedule → scheduleController) exists │
-│  but is NEVER app.use()'d here — dead from the outside.          │
-│  See Known Issue #16.                                           │
-│                                                                 │
-│  No auth/user-context middleware is mounted anywhere — see      │
-│  Known Issue #4.                                                │
+│  getUserContext (middlewares/user-context.middleware.ts) is now │
+│  mounted on every route above. It doesn't verify a JWT itself — │
+│  it just reads x-user-id and 401s if missing, trusting whatever │
+│  sits in front of it (api-gateway) to have done real auth.      │
 └───────────┬─────────────────────────────────────┬─────────────┘
             │ Prisma (@prisma/adapter-pg)          │ kafkajs producer
             ▼                                     ▼
@@ -91,16 +97,15 @@ There's no update or delete endpoint for any resource, and no working read endpo
    │  PostgreSQL           │            │  Kafka (localhost:9093)     │
    │  stations, trains,    │            │  admin.station-created  ✅  │
    │  seats, routes,       │            │  admin.train-created    ✅  │
-   │  route_stations,      │            │  admin.route-created    —  │
-   │  schedules            │            │  admin.schedule-created —  │
-   │  (all written to by   │            │  admin.schedule-cancelled— │
+   │  route_stations,      │            │  admin.route-created    ✅  │
+   │  schedules            │            │  admin.schedule-created ✅  │
+   │  (all written to by   │            │  admin.schedule-cancelled ❌│
    │  at least one path in │            │  (publish methods exist    │
-   │  this service, though │            │  for all 5; only station-  │
-   │  route/schedule paths │            │  created and train-created │
-   │  have bugs — see       │            │  are ever actually called) │
-   │  Request Lifecycle)   │            └──────────────┬──────────────┘
-   └──────────────────────┘                            │ consumed by
-                                                        ▼
+   │  this service; every  │            │  for all 5; only schedule- │
+   │  creation path now    │            │  cancelled has no caller)  │
+   │  succeeds for its     │            └──────────────┬──────────────┘
+   │  happy path)          │                           │ consumed by
+   └──────────────────────┘                            ▼
                                         inventory-service, search-service
                                         (per shared/constants/kafka-topics.ts
                                         comments — not verified from their
@@ -114,37 +119,36 @@ There's no update or delete endpoint for any resource, and no working read endpo
 ```
 admin-service/
 ├── src/
-│   ├── index.ts                          # Entry point — imports two modules that don't exist (see below)
-│   ├── server.ts                         # Express app: middleware + route mounting (station + train only)
+│   ├── index.ts                          # Entry point — dotenv.config() now runs first, then starts
+│   │                                      # the server and wires graceful shutdown (SIGTERM/SIGINT)
+│   ├── server.ts                         # Express app: middleware + route mounting (station + train + schedule)
 │   ├── config/
+│   │   ├── index.ts                      # NEW this pass — the Config object every other file imports
 │   │   ├── kafka.ts                      # Kafka client + producer (connect/disconnect)
 │   │   ├── logger.ts                     # Winston logger
 │   │   └── prisma.ts                     # PrismaClient singleton (pg adapter)
-│   │   # NOTE: index.ts and every file above import a "config" object from
-│   │   # "./config" / "../config" / "." / "./index" — none of which resolve
-│   │   # to a real file. There is no config/index.ts or config/db.ts here.
 │   ├── controllers/
 │   │   ├── station.controller.ts         # POST /stations/station
-│   │   ├── train.controller.ts           # POST /trains/train, /trains/route, /trains/route/:id (broken)
-│   │   └── schedule.controller.ts        # POST /schedule — defined but never mounted
+│   │   ├── train.controller.ts           # POST /trains/train, POST /trains/route, GET /trains/train/:trainId
+│   │   └── schedule.controller.ts        # POST /schedules/schedule
 │   ├── services/
 │   │   ├── station.service.ts            # Station creation + Kafka publish
-│   │   ├── train.service.ts              # Train+seats creation, route creation (has an inverted bug), getTrainById
-│   │   └── schedule.service.ts           # Schedule creation + denormalized Kafka publish (unreachable via HTTP)
+│   │   ├── train.service.ts              # Train+seats creation, route creation (existence-check bug fixed), getTrainById
+│   │   └── schedule.service.ts           # Schedule creation + denormalized Kafka publish
 │   ├── routes/
-│   │   ├── station.route.ts
-│   │   ├── train.routes.ts
-│   │   └── schedule.route.ts             # Defines POST /schedule but is never app.use()'d in server.ts
+│   │   ├── station.route.ts              # getUserContext + stationController.createStation
+│   │   ├── train.routes.ts               # getUserContext + trainController's 3 handlers
+│   │   └── schedule.route.ts             # getUserContext + scheduleController.createSchedule — now mounted at /schedules in server.ts
 │   ├── kafka/producer/
 │   │   └── admin.producer.ts             # publishStationCreated/TrainCreated/RouteCreated/ScheduleCreated/ScheduleCancelled
 │   ├── middlewares/
-│   │   ├── cors.middleware.ts
+│   │   ├── cors.middleware.ts            # ALLOWED_ORIGINS split is now undefined-safe
 │   │   ├── error.middleware.ts
 │   │   ├── req.middleware.ts
-│   │   └── user-context.middleware.ts    # Defined, but never mounted anywhere
+│   │   └── user-context.middleware.ts    # Now actually mounted on every route
 │   ├── types/
 │   │   ├── zod.ts                        # zStation, zSeat, zTrain, zRouteStation, zRoute, zSchedule schemas
-│   │   └── index.ts                      # KnowledgeDoc/RAGResponse — unrelated to this service
+│   │   └── express.d.ts                  # NEW this pass — augments Express.Request with `user`
 │   ├── utils/
 │   │   ├── api-response.ts               # SuccessResponse/ErrorResponse helpers
 │   │   ├── asyncHandler.ts               # Wraps async route handlers, forwards errors to next()
@@ -154,10 +158,13 @@ admin-service/
 ├── prisma/
 │   └── schema.prisma                     # Station, Train, Seat, Route, RouteStation, Schedule
 ├── docs/                                  # This documentation
+├── .env.example                          # NEW this pass — PORT=4003 and admin-appropriate values (no .env is committed)
 ├── package.json
 ├── tsconfig.json
-└── .env
+└── prisma.config.ts
 ```
+
+`src/types/index.ts` — the old `KnowledgeDoc`/`RAGResponse` (RAG/document-embedding) type file that imported `mongoose` for no reason and that nothing under `src/` ever imported — has been deleted entirely in this pass.
 
 `tsconfig.json` sets `rootDir: ".."`, mirroring the other services in this repo — it points one level above `admin-service/` so the project can compile files it reaches via `../../shared/...`-style imports; `admin.producer.ts`'s import of `../../../../shared/constants/kafka-topics` is the one file under `src/` that actually uses this.
 
@@ -165,16 +172,21 @@ admin-service/
 
 ## Request Lifecycle
 
-### Case A: `POST /trains/train` (happy path — a fully-correct flow in this service)
+### Case A: `POST /trains/train` (happy path)
 
 ```
 1.  Client sends POST /trains/train with:
       { trainNumber, trainName, coachName?, seats: [{ seatNumber, seatType, price }, ...] }
+      and an x-user-id header (set by api-gateway's requireAuth after JWT
+      verification, or supplied directly by a caller talking to admin-service
+      without going through the gateway)
 2.  server.ts middleware runs: helmet → corsMiddleware → reqLogger → cookieParser →
     express.json()
-3.  train.routes.ts matches POST /train (mounted at /trains) → trainController.createTrain
-4.  zTrain.safeParse validates the body — trims strings, requires seats.length >= 1,
-    validates each seat's seatType against the SeatType enum
+3.  train.routes.ts matches POST /train (mounted at /trains). getUserContext runs
+    first: reads req.headers["x-user-id"], sets req.user = { id }, calls next()
+4.  trainController.createTrain: zTrain.safeParse validates the body — trims
+    strings, requires seats.length >= 1, validates each seat's seatType against
+    the SeatType enum
 5.  The controller's own `if (seats.length === 0)` check passes trivially — zTrain
     already guarantees this
 6.  await trainService.createTrain({ trainName, trainNumber, coachName, seats }):
@@ -187,83 +199,109 @@ admin-service/
 7.  Controller responds 200 { success: true, message: "Train created successfully" }
 ```
 
-### Case B: `POST /trains/route` on a train that has no route yet (the common case — and it always fails)
+### Case B: `POST /trains/route` on a train that has no route yet (happy path — previously always failed here, now fixed)
 
 ```
-1.  Client sends POST /trains/route with:
+1.  Client sends POST /trains/route with an x-user-id header and:
       { trainId, stations: [{ stationId, sequenceNumber, arrivalTime?,
         departureTime?, distanceFromOrigin? }, ...] } (>= 2 stations)
-2.  train.routes.ts matches POST /route (mounted at /trains) → trainController.createRoute
+2.  getUserContext passes the request through → train.routes.ts matches POST
+    /route (mounted at /trains) → trainController.createRoute
 3.  zRoute.safeParse validates the body
 4.  trainService.createRoute({ trainId, stations }):
-      a. prisma.train.findUnique({ id: trainId }) → found
-      b. prisma.route.findUnique({ trainId }) → not found (this train has no route yet)
-      c. BUG: the code reads `if (!existingRoute) throw new NotFoundError(
-         "Route already existis for this train")` — i.e. it throws "already
-         exists" precisely when no route exists. This is inverted from what
-         was clearly intended.
-5.  Response: 404 { success: false, error: "NOT_FOUND", message: "Route already
-    existis for this train" } — for a train that has never had a route created.
+      a. prisma.train.findUnique({ id: trainId }, include: { seats: ... }) → found.
+         Seats are fetched here too, so the same row can be reused for the Kafka
+         payload below without a second query
+      b. prisma.route.findUnique({ trainId }) → not found (this train has no route
+         yet). The existence check now reads the right way round —
+         `if (existingRoute) throw new ConflictError("Route already exists for
+         this train")` — so it only throws when a route *does* already exist,
+         and a brand-new train correctly falls through to route creation
+      c. every stationId in the payload is checked to exist; sequenceNumbers are
+         checked for being contiguous starting at 1 (the error message now reads
+         "Sequence numbers must be contiguous starting from 1" — both the
+         "continous starting free" and "existis" typos from before are gone)
+      d. prisma.route.create(...) inserts the route and its RouteStation rows in
+         one nested Prisma write
+      e. adminProducer.publishRouteCreated({ ...route, train: existingTrain }) →
+         Kafka topic admin.route-created, keyed by route-<id>. The payload is a
+         RouteCreatedPayload — the route plus the train (with its seats) inlined
+         — because search-service's indexTrainRoute consumer destructures
+         { train, routeStations } directly off the event and would silently
+         no-op without a train field. This publish is caught and logged on
+         failure, not thrown (same pattern as trainService.createTrain)
+5.  Response: 200 { success: true, message: "Route created successfully" }
 ```
 
-There is, as written, no way to successfully create a *first* route for a train through this endpoint. (If a route already *did* exist, step 4c's condition would be false, and execution would fall through to `prisma.route.create`, which would then throw a raw Prisma unique-constraint error on `Route.trainId` instead of a clean `ConflictError` — see [Known Issue #14](#known-issues--inconsistencies).)
+If a route already *did* exist for this train, step 4b's `ConflictError` fires cleanly with a 409 before `prisma.route.create` is ever reached — no raw Prisma unique-constraint error leaks through.
 
-### Case C: `POST /stations/station` with an invalid body (validation failure)
-
-```
-1.  Client sends POST /stations/station with { name: "NY", code: "NYC", city: "New York" }
-2.  stationController.createStation: zStation.safeParse fails — "Station name must be
-    at least 4 characters" ("NY" is 2 characters)
-3.  ErrorResponse(res, 400, { message: "Station name must be at least 4 characters" })
-    is returned directly inside the asyncHandler callback — no error is thrown, so
-    errorHandler never runs for this case
-4.  Response: 400 { success: false, message: "Station name must be at least 4 characters" }
-```
-
-### Case D: `POST /stations/station` with a code that already exists (illustrates the missing `await`)
+### Case C: any route with no `x-user-id` header (auth failure — new behavior)
 
 ```
-1.  Client sends POST /stations/station with a code that's already in the database,
-    e.g. "NDLS"
-2.  zStation validation passes
-3.  stationController.createStation calls stationService.createStation({...}) but does
-    NOT await or return the promise it returns
-4.  Because nothing is awaiting it, execution falls straight through to the next line:
-    res.status(200).json({ success: true, message: "OTP sent successfully" }) — the
-    client gets a 200 OK before the service call has even resolved
-5.  Meanwhile, inside stationService.createStation: prisma.station.findUnique finds the
+1.  Client sends POST /stations/station directly to admin-service (bypassing
+    api-gateway, or through a misconfigured proxy) without an x-user-id header
+2.  server.ts middleware runs (helmet, cors, reqLogger, cookieParser, json) →
+    station.route.ts matches POST /station (mounted at /stations) →
+    getUserContext runs before stationController.createStation
+3.  req.headers["x-user-id"] is undefined, so getUserContext calls
+    next(new UnauthorizedError("User context missing - must come through gateway"))
+    — the request never reaches Zod validation or the controller at all
+4.  errorHandler catches the UnauthorizedError (an AppError) and responds with
+    its own status/code
+5.  Response: 401 { success: false, error: "UNAUTHORIZED", message: "User
+    context missing - must come through gateway" }
+```
+
+This is new behavior: `getUserContext` is now mounted on every route in this service (station, train, and schedule). Before this pass, nothing enforced this middleware anywhere, so this header was silently ignored and any caller could reach every endpoint.
+
+### Case D: `POST /stations/station` with a code that already exists (conflict — the missing `await` bug is fixed)
+
+```
+1.  Client sends POST /stations/station with an x-user-id header and a code
+    that's already in the database, e.g. "NDLS"
+2.  getUserContext passes it through → zStation validation passes
+3.  stationController.createStation now awaits stationService.createStation({...})
+4.  Inside stationService.createStation: prisma.station.findUnique finds the
     existing row and throws ConflictError("Station already exists")
-6.  That rejection has nowhere to go. asyncHandler's `.catch(next)` only wraps the
-    promise returned by the outer async callback, and that callback already returned
-    (at step 4) without ever awaiting the inner call. The rejection becomes an
-    unhandled promise rejection instead of reaching errorHandler.
-7.  Net effect: a duplicate-station request looks like a success (200, "OTP sent
-    successfully") to the caller. No new row is created, but the caller has no way to
-    know that from the response — the real error only shows up as an unhandled
-    rejection in the server's own logs.
+5.  Because createStation is now awaited, the rejection propagates back out of
+    the async handler; asyncHandler's `.catch(next)` forwards it to
+    errorHandler, which responds using the AppError's own status/code
+6.  Response: 409 { success: false, error: "CONFLICT", message: "Station
+    already exists" } — no new row is created, and the caller now gets an
+    honest error instead of a false 200 (see Known Issues for how this used
+    to behave)
 ```
 
-### Case E: `scheduleService.createSchedule` (hypothetical — no HTTP path reaches it today)
-
-`schedule.route.ts` defines `POST /schedule → scheduleController.createSchedule`, but `server.ts` never imports or `app.use()`s that router — so this flow can currently only be exercised by importing `scheduleService` directly (e.g. from a test), never by an actual HTTP request. Documented here as it's written to work, once/if it gets mounted:
+### Case E: `POST /schedules/schedule` (happy path — now reachable via HTTP)
 
 ```
-1.  Caller invokes scheduleService.createSchedule({ trainId, departureDate })
-2.  prisma.train.findUnique({ id: trainId }, include seats + route + routeStations + station)
-3.  Throws ConflictError if the train doesn't exist, BadRequestError if it has no seats
-    or no route yet (a schedule needs both)
-4.  departureDate is re-parsed with `new Date(...)` and checked for NaN
-5.  prisma.schedule.findUnique({ trainId_departureDate }) → checked for a duplicate;
-    ConflictError if one already exists for that exact date
-6.  prisma.schedule.create({ trainId, departureDate }) inserts the schedule row
-7.  A denormalized eventPayload is assembled: schedule id/status, train's id/number/
-    name/coachName/totalSeats, every seat, and every route stop (with full station
-    details) — all inlined so downstream consumers don't need a follow-up call
-8.  adminProducer.publishScheduleCreated(eventPayload) → Kafka topic
-    admin.schedule-created, keyed by schedule-<scheduleId>
-9.  createSchedule returns "" (an empty string, not the created schedule or payload)
-10. scheduleController.createSchedule responds 200 with message "Train created
-    successfully" — copy-pasted from train.controller.ts, describes the wrong resource
+1.  Client sends POST /schedules/schedule with an x-user-id header and
+    { trainId, departureDate } (see zSchedule)
+2.  schedule.route.ts — now mounted at /schedules in server.ts — matches
+    POST /schedule. getUserContext runs, then scheduleController.createSchedule
+3.  zSchedule.safeParse validates the body
+4.  scheduleService.createSchedule({ trainId, departureDate }):
+      a. prisma.train.findUnique({ id: trainId }, include seats + route +
+         routeStations + station) — throws ConflictError if the train doesn't
+         exist, BadRequestError if it has no seats or no route yet (a schedule
+         needs both)
+      b. departureDate is re-parsed with `new Date(...)` and checked for NaN
+      c. prisma.schedule.findUnique({ trainId_departureDate }) → checked for a
+         duplicate; ConflictError if one already exists for that exact date
+      d. prisma.schedule.create({ trainId, departureDate }) inserts the schedule row
+      e. a denormalized eventPayload is assembled: schedule id/status, the
+         train's id/number/name/coachName/totalSeats, every seat, and every
+         route stop (with full station details) — all inlined so downstream
+         consumers don't need a follow-up call
+      f. adminProducer.publishScheduleCreated(eventPayload) → Kafka topic
+         admin.schedule-created, keyed by schedule-<scheduleId>. Unlike train
+         and route creation, this publish is not wrapped in a .catch — a
+         broker failure here throws
+      g. createSchedule still returns "" (an empty string, not the created
+         schedule or payload) — unchanged by this pass, see Known Issues
+5.  scheduleController.createSchedule responds 200 { success: true, message:
+    "Schedule created successfully" } — the old copy-pasted "Train created
+    successfully" message is fixed
 ```
 
 ---
@@ -273,23 +311,47 @@ There is, as written, no way to successfully create a *first* route for a train 
 ### 1. `index.ts` — Entry Point
 
 ```typescript
+import dotenv from "dotenv";
+dotenv.config();
+
 import app from "./server";
 import { config } from "./config";
-import connectDB from "./config/db";
-import dotenv from "dotenv";
+import logger from "./config/logger";
+import { disconnectProducer } from "./config/kafka";
 
-dotenv.config();
-app.listen(config.PORT, () => {
-  console.log(`Server running on port ${config.PORT}`);
-});
+const startServer = async (): Promise<void> => {
+  try {
+    const server = app.listen(config.PORT, () => {
+      logger.info(`${config.SERVICE_NAME} is running on port ${config.PORT}`);
+    });
+
+    const shutdown = async (): Promise<void> => {
+      logger.info("Shutting down gracefully...");
+
+      server.close(async () => {
+        await disconnectProducer();
+        logger.info("Server closed");
+        process.exit(0);
+      });
+    };
+
+    process.on("SIGTERM", () => void shutdown());
+    process.on("SIGINT", () => void shutdown());
+  } catch (error) {
+    logger.error("Failed to start server", { error: (error as Error).message });
+    process.exit(1);
+  }
+};
+
+void startServer();
 ```
 
-In plain English, this is meant to: load `.env`, then start listening on `config.PORT`. Two problems, in order of how badly they'd bite:
+This is a substantially fuller entry point than before. Two things changed in this pass:
 
-1. `./config` and `./config/db` don't exist anywhere in `src/` — this file fails to even type-check or run (`npx tsc --noEmit` reports `Cannot find module './config'` and `Cannot find module './config/db'` for these two lines).
-2. Even once those files exist, `import { config } from "./config"` is hoisted and evaluated before `dotenv.config()` runs on line 6 — so if `config/index.ts` builds its object by reading `process.env.X` at module-load time (as every other service's `config/index.ts` in this repo does), any variable that's only set in `.env` (and not already in the shell environment) would still be `undefined` at that point.
+1. `dotenv.config()` now runs on line 2, before `import app from "./server"` and every other import that transitively pulls in `config/index.ts`. Since `config/index.ts` builds its `Config` object by reading `process.env.*` at module-load time, this ordering matters: any variable set only in `.env` (not already in the shell environment) is now guaranteed to be populated by the time `config` is built. Before this fix, `dotenv.config()` ran *after* the `import { config } from "./config"` line — too late to affect anything, since ES module imports are hoisted and evaluated before the rest of the file's own statements run.
+2. The dead `import connectDB from "./config/db"` — a leftover Mongoose-style import pointing at a file that never existed in this project, and that was never called anywhere even when it "existed" in intent — has been removed. Prisma's own `config/prisma.ts` already owns the database connection; there was never a `connectDB` to call.
 
-`connectDB` is imported but never called anywhere in this file — its only use is the import itself.
+The rest — `startServer`, graceful shutdown on `SIGTERM`/`SIGINT` that closes the HTTP server and disconnects the Kafka producer before exiting — was already structured this way and is unchanged by this pass.
 
 ---
 
@@ -304,6 +366,7 @@ import errorHandler from "./middlewares/error.middleware";
 import { reqLogger } from "./middlewares/req.middleware";
 import stationRoutes from "./routes/station.route";
 import trainRoutes from "./routes/train.routes";
+import scheduleRoutes from "./routes/schedule.route";
 
 const app = express();
 
@@ -316,17 +379,20 @@ app.use(cookieParser());
 app.use(express.json());
 app.use("/stations", stationRoutes);
 app.use("/trains", trainRoutes);
+app.use("/schedules", scheduleRoutes);
 
 app.get("/", (req, res) => {
-  // Response text is a holdover from whatever service this was scaffolded from.
-  res.send("Hello from index.js of user-service");
+  res.send("Hello from admin-service");
 });
 
 app.get("/health", (req, res) => {
   res.status(200).json({
-    message: "ok",
+    success: true,
+    message: "Admin Service is healthy",
+    timestamp: new Date().toISOString(),
   });
 });
+
 // Must be registered after all routes — Express only treats a 4-arg
 // middleware as an error handler when it's last in the chain.
 app.use(errorHandler);
@@ -334,11 +400,52 @@ app.use(errorHandler);
 export default app;
 ```
 
-This is the entire app definition: two route groups (`/stations`, `/trains`), a root `GET /` that still identifies itself as "user-service" in its response text, a `GET /health`, and the error handler registered last. **`schedule.route.ts` is not imported or mounted here at all** — see [Known Issue #16](#known-issues--inconsistencies). No auth middleware is applied anywhere in this chain.
+This is the entire app definition: three route groups (`/stations`, `/trains`, `/schedules`), a root `GET /` (now correctly says "admin-service" instead of a leftover "user-service" string), a `GET /health` that now returns a `success`/`message`/`timestamp` body instead of a bare `{ message: "ok" }`, and the error handler registered last. `schedule.route.ts` is now imported and mounted here — previously it wasn't, and the entire schedule-creation feature was unreachable from outside the process. Auth (`getUserContext`) is applied per-route inside each router file (see [File Structure](#file-structure)), not centrally in `server.ts`.
 
 ---
 
-### 3. `config/` — Kafka, Logger, Prisma
+### 3. `config/` — Env, Kafka, Logger, Prisma
+
+**`config/index.ts`** — new this pass. This file was empty before; every other file in the project imports a `config` object from it (`"."`, `"./index"`, `"../config"`, `"./config"`), so its absence was the root cause of the service failing to compile. It reads `package.json`'s own `name` field for `SERVICE_NAME` (kept out of `.env` on purpose, matching the pattern used elsewhere in this repo) and everything else from `process.env`:
+
+```typescript
+import { readFileSync } from "fs";
+import { resolve } from "path";
+
+// require("../../package.json") would type package.json's export as `any`;
+// reading + parsing it manually keeps the `any` confined to this one
+// external-boundary assertion instead of leaking into Config.SERVICE_NAME.
+const packageJsonPath = resolve(process.cwd(), "./package.json");
+const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as {
+  name: string;
+};
+
+interface Config {
+  SERVICE_NAME: string;
+  PORT: number;
+  NODE_ENV: string;
+  LOG_LEVEL: string;
+  DATABASE_URL: string | undefined;
+  ALLOWED_ORIGINS: string | undefined;
+  KAFKA_BROKER: string | undefined;
+  KAFKA_CLIENT_ID: string | undefined;
+  INTERNAL_SERVICE_KEY: string | undefined;
+}
+
+export const config: Config = {
+  SERVICE_NAME: packageJson.name,
+  PORT: Number(process.env.PORT) || 4003,
+  NODE_ENV: process.env.NODE_ENV || "development",
+  LOG_LEVEL: process.env.LOG_LEVEL || "info",
+  DATABASE_URL: process.env.DATABASE_URL,
+  ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS,
+  KAFKA_BROKER: process.env.KAFKA_BROKER,
+  KAFKA_CLIENT_ID: process.env.KAFKA_CLIENT_ID,
+  INTERNAL_SERVICE_KEY: process.env.INTERNAL_SERVICE_KEY,
+};
+```
+
+Two fields are on this object but effectively unused elsewhere in `src/` — see [Known Issues #6 and #7](#known-issues--inconsistencies): nothing reads `config.NODE_ENV` (the one place that checks `NODE_ENV` reads the raw `process.env.NODE_ENV` instead), and nothing reads `config.INTERNAL_SERVICE_KEY` at all yet.
 
 **`config/kafka.ts`** — the Kafka client and producer, plus idempotent connect/disconnect helpers:
 
@@ -365,7 +472,7 @@ const producer: Producer = kafka.producer({
 });
 ```
 
-`idempotent: true` guarantees each message is written exactly once per partition on retry, which is why `maxInFlightRequests` is capped at 5 (required for that guarantee to hold). `connectProducer()`/`disconnectProducer()` both track an `isConnected` flag so calling either more than once is a no-op. Like every other file in this directory, `config/kafka.ts` imports `{ config } from "."` — a module that doesn't exist (see Known Issue #1).
+`idempotent: true` guarantees each message is written exactly once per partition on retry, which is why `maxInFlightRequests` is capped at 5 (required for that guarantee to hold). `connectProducer()`/`disconnectProducer()` both track an `isConnected` flag so calling either more than once is a no-op. This file's `import { config } from "."` now resolves correctly, since `config/index.ts` exists.
 
 **`config/logger.ts`** — a single shared Winston logger:
 
@@ -413,11 +520,13 @@ if (process.env.NODE_ENV !== "production") {
 export default prisma;
 ```
 
+Note the last check reads the raw `process.env.NODE_ENV` rather than `config.NODE_ENV` — both currently resolve to the same value, but it's an inconsistency worth knowing about (see Known Issues).
+
 ---
 
-### 4. `types/` — Validation Schemas & a Stray Type File
+### 4. `types/` — Validation Schemas & Express Augmentation
 
-**`types/zod.ts`** defines every schema a request goes through:
+**`types/zod.ts`** defines every schema a request goes through (unchanged by this pass):
 
 - `zStation` — `name` (4–40 chars), `code` (2–10 chars, trimmed and uppercased by the schema itself), `city` (2–40 chars), optional `state` (≤40 chars)
 - `zSeat` — `seatNumber` (positive int), `seatType` (`LOWER | MIDDLE | UPPER | SIDE_LOWER | SIDE_UPPER`), `price` (positive number)
@@ -428,29 +537,27 @@ export default prisma;
 
 `StationBodyType`, `SeatBodyType`, `TrainBodyType`, `RouteStationBodyType`, `RouteBodyType`, and `ScheduleBodyType` are the corresponding `z.infer<...>` types used throughout the controllers and services.
 
-**`types/index.ts`** is unrelated to any of the above:
+**`types/express.d.ts`** — new this pass:
 
 ```typescript
-import { Types } from "mongoose";
-
-export interface KnowledgeDoc {
-  _id: Types.ObjectId | string;
-  title: string;
-  content: string;
-  tags: string[];
-  createdAt: Date;
-  embedding: number[];
-  sim?: number;
+// Augments Express's Request type with the `user` field that
+// getUserContext attaches after reading the gateway's x-user-id header.
+declare global {
+  namespace Express {
+    interface Request {
+      user?: {
+        id: string;
+      };
+    }
+  }
 }
 
-export interface RAGResponse {
-  answer: string;
-  sources: { id: string; title: string }[];
-  confidence: "high" | "medium" | "low";
-}
+export {};
 ```
 
-Nothing under `src/` imports either of these interfaces. They describe a document-embedding / retrieval-augmented-generation feature that has nothing to do with stations, trains, routes, or schedules — see Known Issues for how this lines up with other leftovers in this project.
+This is what makes `middlewares/user-context.middleware.ts`'s `req.user = {...}` assignment type-check — before this file existed, `npx tsc --noEmit` reported `Property 'user' does not exist on type 'Request<...>'` here, the same pattern api-gateway's own `auth.middleware.ts` already solved for itself.
+
+`src/types/index.ts` — which previously defined `KnowledgeDoc`/`RAGResponse` (a document-embedding/RAG shape, importing `mongoose`, with no relation to stations/trains/routes/schedules, and that nothing under `src/` ever imported) — has been deleted entirely in this pass.
 
 ---
 
@@ -471,29 +578,29 @@ const createStation = asyncHandler(
 
     const { name, code, city, state } = result.data;
 
-    // Note: not awaited. zStation's `code` field already applies
-    // `.toUpperCase()`, so this second `.toUpperCase()` is a no-op on an
-    // already-uppercased value. More importantly, since the returned
-    // promise is neither awaited nor returned, the response below fires
-    // before the DB write / Kafka publish settle, and a rejection here
-    // (e.g. ConflictError on a duplicate code) becomes an unhandled
-    // promise rejection instead of reaching errorHandler.
-    const station = stationService.createStation({
-      code: code.toUpperCase(),
+    // zStation's `code` field already applies `.toUpperCase()` via zod, so
+    // this call passes it straight through rather than re-uppercasing.
+    const station = await stationService.createStation({
+      code,
       name,
       city,
       state,
     });
 
-    // Message text is a holdover from a different (OTP-based) flow.
-    res.status(200).json({ success: true, message: "OTP sent successfully" });
+    res.status(200).json({
+      success: true,
+      message: "Station created successfully",
+      data: station,
+    });
   },
 );
+
+export const stationController = { createStation };
 ```
 
-The bigger issue is that `stationService.createStation(...)`'s returned promise is neither awaited nor returned — see [Lifecycle Case D](#case-d-post-stationsstation-with-a-code-that-already-exists-illustrates-the-missing-await) for exactly what that causes.
+Two bugs are fixed here: `stationService.createStation(...)` is now `await`ed (so a rejection — e.g. `ConflictError` on a duplicate code — correctly propagates to `asyncHandler`'s `.catch(next)` and on to `errorHandler`, instead of becoming an unhandled promise rejection while the client gets a false 200), and the response message is now `"Station created successfully"` instead of a leftover `"OTP sent successfully"` from a different (OTP-based) flow. See [Lifecycle Case D](#case-d-post-stationsstation-with-a-code-that-already-exists-conflict--the-missing-await-bug-is-fixed) for the corrected flow.
 
-`services/station.service.ts`:
+`services/station.service.ts` (unchanged by this pass):
 
 ```typescript
 const createStation = async ({ code, name, city, state }: StationBodyType) => {
@@ -520,22 +627,26 @@ const createStation = async ({ code, name, city, state }: StationBodyType) => {
   await adminProducer.publishStationCreated(createdStation);
   return createdStation;
 };
+
+export const stationService = { createStation };
 ```
 
-Unlike `trainService.createTrain` below, the Kafka publish here isn't wrapped in a `.catch` — a publish failure throws and would normally turn an already-committed station creation into a 500 from the controller. In practice it can't even do that today, because the controller never awaits this function in the first place.
+The comment above the Kafka publish is itself now slightly stale — it still describes the "never awaits this function" behavior that was true before this pass, but the controller now does await it. The underlying fact that remains true is that this publish still isn't wrapped in a `.catch`, unlike `trainService.createTrain` — a Kafka failure here still throws, and now that the controller awaits the call, that rejection really would surface as a 500 from `errorHandler` if the broker were down.
 
 ---
 
 ### 6. Train & Route — controller + service
 
-`controllers/train.controller.ts` now defines three handlers: `createTrain`, `createRoute`, and `getTrainById`.
+`controllers/train.controller.ts` defines three handlers: `createTrain`, `createRoute`, and `getTrainById`.
 
 ```typescript
 const createTrain = asyncHandler(
   async (req: Request, res: Response, next: NextFunction) => {
     const result = zTrain.safeParse(req.body);
     if (!result.success) {
-      return ErrorResponse(res, 400, { message: formatZodError(result.error) });
+      return ErrorResponse(res, 400, {
+        message: formatZodError(result.error),
+      });
     }
 
     const { trainName, trainNumber, coachName, seats } = result.data;
@@ -544,21 +655,28 @@ const createTrain = asyncHandler(
       throw new BadRequestError("Atleast one seat must be defined");
     }
 
-    await trainService.createTrain({ trainName, trainNumber, coachName, seats });
+    await trainService.createTrain({
+      trainName,
+      trainNumber,
+      coachName,
+      seats,
+    });
 
-    res.status(200).json({ success: true, message: "Train created successfully" });
+    res
+      .status(200)
+      .json({ success: true, message: "Train created successfully" });
   },
 );
 ```
-
-This one awaits the service call correctly, so a thrown `ConflictError`/`BadRequestError` reaches `asyncHandler`'s `.catch(next)` and, from there, `errorHandler`, as expected.
 
 ```typescript
 const createRoute = asyncHandler(
   async (req: Request, res: Response, next: NextFunction) => {
     const result = zRoute.safeParse(req.body);
     if (!result.success) {
-      return ErrorResponse(res, 400, { message: formatZodError(result.error) });
+      return ErrorResponse(res, 400, {
+        message: formatZodError(result.error),
+      });
     }
 
     const { stations, trainId } = result.data;
@@ -567,9 +685,14 @@ const createRoute = asyncHandler(
       throw new BadRequestError("A route must have at least 2 stations");
     }
 
-    await trainService.createRoute({ stations, trainId });
+    await trainService.createRoute({
+      stations,
+      trainId,
+    });
 
-    res.status(200).json({ success: true, message: "Route created successfully" });
+    res
+      .status(200)
+      .json({ success: true, message: "Route created successfully" });
   },
 );
 ```
@@ -582,29 +705,49 @@ const getTrainById = asyncHandler(
       throw new BadRequestError("Train Id is missing");
     }
     const train = await trainService.getTrainById(trainId as string);
-    return res.status(200).json({ success: true, data: train });
+    return res.status(200).json({
+      success: true,
+      data: train,
+    });
   },
 );
+export const trainController = { getTrainById, createTrain, createRoute };
 ```
 
-`getTrainById` reads `req.params.trainId`, but the route it's mounted on (`POST /trains/route/:id`, see below) names the param `:id`, not `:trainId` — so `trainId` is always `undefined` and every call to this endpoint 400s with "Train Id is missing" before `trainService.getTrainById` is ever reached. It's also mounted as `POST` despite being a pure read. See [Known Issue #13](#known-issues--inconsistencies).
+`getTrainById` reads `req.params.trainId`, and it's now mounted as `GET /trains/train/:trainId` (see `train.routes.ts` below) — the param name finally matches, so this endpoint works. Before this pass it was mounted as `POST /trains/route/:id`, which named the param `:id` while the controller read `req.params.trainId`, so `trainId` was always `undefined` and the handler always 400'd with "Train Id is missing" before `trainService.getTrainById` was ever reached.
 
 `routes/train.routes.ts`:
 
 ```typescript
-router.post("/train", trainController.createTrain); // POST /trains/train — create train + seats
-router.post("/route", trainController.createRoute); // POST /trains/route — define a train's route
-router.post("/route/:id", trainController.getTrainById); // broken — see above
+import { Router } from "express";
+import { trainController } from "../controllers/train.controller";
+import { getUserContext } from "../middlewares/user-context.middleware";
+
+const router = Router();
+
+// Mounted at /trains in server.ts.
+router.post("/train", getUserContext, trainController.createTrain); // POST /trains/train — create train + seats
+router.post("/route", getUserContext, trainController.createRoute); // POST /trains/route — define a train's route
+router.get("/train/:trainId", getUserContext, trainController.getTrainById); // GET /trains/train/:trainId — fetch a train with seats + route
+
+export default router;
 ```
 
 `services/train.service.ts`:
 
 ```typescript
-const createTrain = async ({ trainName, trainNumber, coachName, seats }: TrainBodyType) => {
+const createTrain = async ({
+  trainName,
+  trainNumber,
+  coachName,
+  seats,
+}: TrainBodyType) => {
+  // Train number is the unique identifier — reject duplicates before hitting the DB constraint
   const existing = await prisma.train.findUnique({ where: { trainNumber } });
   if (existing) {
     throw new ConflictError("Train with this number already exists");
   }
+  // Guard against two seats in the same payload sharing a seat number
   const seatNumbers = seats.map((s) => s.seatNumber);
   if (new Set(seatNumbers).size !== seatNumbers.length) {
     throw new BadRequestError("Duplicate seat numbers found");
@@ -613,8 +756,10 @@ const createTrain = async ({ trainName, trainNumber, coachName, seats }: TrainBo
     data: {
       trainNumber,
       trainName,
+      // Defaults to "AC" when the client omits coachName (zTrain marks it optional)
       coachName: coachName || "AC",
       totalSeats: seats.length,
+      // Nested write — train and all of its seats are created in one transaction
       seats: {
         create: seats.map((seat) => ({
           seatNumber: seat.seatNumber,
@@ -625,35 +770,52 @@ const createTrain = async ({ trainName, trainNumber, coachName, seats }: TrainBo
     },
     include: { seats: { orderBy: { seatNumber: "asc" } } },
   });
+  // Unlike stationService.createStation, a publish failure here is caught and
+  // logged rather than thrown — the train is already committed, so a Kafka
+  // outage shouldn't turn a successful creation into a 500.
   await adminProducer.publishTrainCreated(train).catch((err) => {
-    logger.error("Failed to publish train created event", { error: err.message });
+    logger.error("Failed to publish train created event", {
+      error: err.message,
+    });
   });
 
   return train;
 };
 ```
 
-The nested `seats: { create: [...] }` write inserts the train row and every seat row in one transaction — `totalSeats` is just `seats.length`, not a separately-counted value. The `.catch` on the Kafka publish means a broker outage is logged but never fails the request — the opposite of what happens in `stationService.createStation`.
+This function is unchanged by this pass. The nested `seats: { create: [...] }` write inserts the train row and every seat row in one transaction — `totalSeats` is just `seats.length`, not a separately-counted value.
 
 ```typescript
 const createRoute = async ({ trainId, stations }: RouteBodyType) => {
-  const existingTrain = await prisma.train.findUnique({ where: { id: trainId } });
+  // Train must already exist — a route can't be attached to a train that isn't there.
+  // Seats are fetched here too so the same row can be inlined into the
+  // ROUTE_CREATED event below without a second query.
+  const existingTrain = await prisma.train.findUnique({
+    where: { id: trainId },
+    include: { seats: { orderBy: { seatNumber: "asc" } } },
+  });
   if (!existingTrain) {
     throw new NotFoundError("Train Not found");
   }
   const existingRoute = await prisma.route.findUnique({ where: { trainId } });
-  if (!existingRoute) {
-    throw new NotFoundError("Route already existis for this train");
+  if (existingRoute) {
+    throw new ConflictError("Route already exists for this train");
   }
   const stationIds = stations.map((station) => station.stationId);
-  const existingStations = await prisma.station.findMany({ where: { id: { in: stationIds } } });
+  const existingStations = await prisma.station.findMany({
+    where: { id: { in: stationIds } },
+  });
   if (existingStations.length !== stationIds.length) {
     throw new BadRequestError("One or more station Ids are invalid");
   }
-  const sorted = [...stations].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+  const sorted = [...stations].sort(
+    (a, b) => a.sequenceNumber - b.sequenceNumber,
+  );
   for (let i = 0; i < sorted.length; i++) {
     if (sorted[i].sequenceNumber !== i + 1) {
-      throw new BadRequestError("Sequence Numbers must be continous starting free");
+      throw new BadRequestError(
+        "Sequence numbers must be contiguous starting from 1",
+      );
     }
   }
   const route = await prisma.route.create({
@@ -670,21 +832,33 @@ const createRoute = async ({ trainId, stations }: RouteBodyType) => {
       },
     },
     include: {
-      routeStations: { include: { station: true }, orderBy: { sequenceNumber: "asc" } },
+      routeStations: {
+        include: { station: true },
+        orderBy: { sequenceNumber: "asc" },
+      },
     },
   });
-  // Commented out in the actual file — a ROUTE_CREATED publish that was
-  // started but never finished (and wouldn't type-check as written, since
-  // adminProducer.publishRouteCreated expects a plain Prisma Route, not a
-  // `{ ...route, train }` shape):
-  //
-  // const trainWithSeats = await prisma.train.findUnique({ ... });
-  // await adminProducer.publishRouteCreated({ ...route, train: trainWithSeats });
+
+  // search-service's indexTrainRoute reads `train` and `routeStations`
+  // directly off the event, so the train (with its seats, fetched above) is
+  // inlined here rather than published as a bare Route row.
+  await adminProducer
+    .publishRouteCreated({ ...route, train: existingTrain })
+    .catch((err) => {
+      logger.error("Failed to publish route created event", {
+        error: err.message,
+      });
+    });
+
   return route;
 };
 ```
 
-The `if (!existingRoute) throw new NotFoundError("Route already existis for this train")` check is inverted — see [Lifecycle Case B](#case-b-post-trainsroute-on-a-train-that-has-no-route-yet-the-common-case--and-it-always-fails) for the exact failure this causes, and [Known Issue #14](#known-issues--inconsistencies).
+Three things are fixed here relative to before:
+
+1. **The existence check is no longer inverted.** It used to read `if (!existingRoute) throw new NotFoundError("Route already existis for this train")` — throwing "already exists" precisely when no route existed, so no train could ever get its first route created. It now reads `if (existingRoute) throw new ConflictError("Route already exists for this train")` — a clean 409 only when a route genuinely already exists, with the "existis" typo also fixed.
+2. **The contiguous-sequence-number message typo is fixed**: `"Sequence Numbers must be continous starting free"` is now `"Sequence numbers must be contiguous starting from 1"`.
+3. **The `publishRouteCreated` call is no longer commented out.** It now fires after the route is created, publishing a `RouteCreatedPayload` — the route plus the train (already fetched above, with its seats) inlined — rather than a bare `Route` row, because search-service's `indexTrainRoute` consumer destructures `{ train, routeStations }` straight off the event.
 
 ```typescript
 const getTrainById = async (id: string) => {
@@ -694,7 +868,10 @@ const getTrainById = async (id: string) => {
       seats: { orderBy: { seatNumber: "asc" } },
       route: {
         include: {
-          routeStations: { include: { station: true }, orderBy: { sequenceNumber: "asc" } },
+          routeStations: {
+            include: { station: true },
+            orderBy: { sequenceNumber: "asc" },
+          },
         },
       },
     },
@@ -702,50 +879,74 @@ const getTrainById = async (id: string) => {
   if (!train) throw new NotFoundError("Train not found");
   return train;
 };
+export const trainService = { getTrainById, createTrain, createRoute };
 ```
 
-This function itself is correct — it's only unreachable because of the routing bug in `getTrainById`'s controller/route pairing described above.
+This function itself was always correct — it's only reachable now because of the routing fix in `getTrainById`'s controller/route pairing described above.
 
 ---
 
-### 7. Schedule — controller + service (unmounted)
+### 7. Schedule — controller + service
 
 `controllers/schedule.controller.ts`:
 
 ```typescript
 const createSchedule = asyncHandler(
   async (req: Request, res: Response, next: NextFunction) => {
+    // Validate incoming body against the zSchedule schema
     const result = zSchedule.safeParse(req.body);
     if (!result.success) {
-      return ErrorResponse(res, 400, { message: formatZodError(result.error) });
+      return ErrorResponse(res, 400, {
+        message: formatZodError(result.error),
+      });
     }
 
     const { trainId, departureDate } = result.data;
     await scheduleService.createSchedule({ trainId, departureDate });
-    return res.status(200).json({ success: true, message: "Train created successfully" });
+    return res
+      .status(200)
+      .json({ success: true, message: "Schedule created successfully" });
   },
 );
+
+export const scheduleController = { createSchedule };
 ```
 
-The success message ("Train created successfully") is a copy-paste leftover from `train.controller.ts` — it names the wrong resource. The file also imports `zRoute` and `zTrain` from `../types/zod`, neither of which it uses.
+The success message is now `"Schedule created successfully"` — it used to say `"Train created successfully"`, a copy-paste leftover from `train.controller.ts`.
 
 `routes/schedule.route.ts`:
 
 ```typescript
-router.post("/schedule", scheduleController.createSchedule);
+import { Router } from "express";
+import { scheduleController } from "../controllers/schedule.controller";
+import { getUserContext } from "../middlewares/user-context.middleware";
+
+const router = Router();
+
+// Mounted at /schedules in server.ts, so this resolves to POST /schedules/schedule.
+router.post("/schedule", getUserContext, scheduleController.createSchedule);
+
+export default router;
 ```
 
-This defines `POST /schedule`, but **`server.ts` never imports or mounts this router** — unlike `station.route.ts` and `train.routes.ts`, there's no `app.use("/something", scheduleRoutes)` anywhere. The entire schedule-creation feature is unreachable from outside the process. See [Known Issue #16](#known-issues--inconsistencies).
+This router itself hasn't changed — what changed is that `server.ts` now actually imports and `app.use("/schedules", scheduleRoutes)`s it. Before this pass, there was no `app.use(..., scheduleRoutes)` anywhere, so the entire schedule-creation feature was fully implemented but completely unreachable from outside the process.
 
-`services/schedule.service.ts`:
+`services/schedule.service.ts` (logic unchanged by this pass):
 
 ```typescript
 const createSchedule = async ({ trainId, departureDate }: ScheduleBodyType) => {
+  // Train number is the unique identifier — reject duplicates before hitting the DB constraint
   const existingTrain = await prisma.train.findUnique({
     where: { id: trainId },
     include: {
       seats: true,
-      route: { include: { routeStations: { include: { station: true } } } },
+      route: {
+        include: {
+          routeStations: {
+            include: { station: true },
+          },
+        },
+      },
     },
   });
   if (!existingTrain) {
@@ -755,7 +956,9 @@ const createSchedule = async ({ trainId, departureDate }: ScheduleBodyType) => {
     throw new BadRequestError("Train not found");
   }
   if (!existingTrain.route) {
-    throw new BadRequestError("Train has no route defined. Create a route first ");
+    throw new BadRequestError(
+      "Train has no route defined. Create a route first ",
+    );
   }
   const parsedDate = new Date(departureDate);
   if (isNaN(parsedDate.getTime())) {
@@ -765,9 +968,13 @@ const createSchedule = async ({ trainId, departureDate }: ScheduleBodyType) => {
     where: { trainId_departureDate: { trainId, departureDate: parsedDate } },
   });
   if (existingSchedule) {
-    throw new ConflictError("Schedule already exists for this train on this date ");
+    throw new ConflictError(
+      "Schedule already exists for this train on this date ",
+    );
   }
-  const schedule = await prisma.schedule.create({ data: { trainId, departureDate: parsedDate } });
+  const schedule = await prisma.schedule.create({
+    data: { trainId, departureDate: parsedDate },
+  });
   const eventPayload = {
     scheduleId: schedule.id,
     trainId: existingTrain.id,
@@ -778,21 +985,32 @@ const createSchedule = async ({ trainId, departureDate }: ScheduleBodyType) => {
     departureDate: departureDate,
     status: schedule.status,
     seats: existingTrain.seats.map((s) => ({
-      seatId: s.id, seatNumber: s.seatNumber, seatType: s.seatType, price: s.price,
+      seatId: s.id,
+      seatNumber: s.seatNumber,
+      seatType: s.seatType,
+      price: s.price,
     })),
     route: existingTrain.route.routeStations.map((rs) => ({
-      stationId: rs.station.id, stationName: rs.station.name, stationCode: rs.station.code,
-      city: rs.station.city, sequenceNumber: rs.sequenceNumber, arrivalTime: rs.arrivalTime,
-      departureTime: rs.departureTime, distanceFromOrigin: rs.distanceFromOrigin,
+      stationId: rs.station.id,
+      stationName: rs.station.name,
+      stationCode: rs.station.code,
+      city: rs.station.city,
+      sequenceNumber: rs.sequenceNumber,
+      arrivalTime: rs.arrivalTime,
+      departureTime: rs.departureTime,
+      distanceFromOrigin: rs.distanceFromOrigin,
     })),
   };
 
+  // This event goes to both inventory-service and search-service via Kafka
   await adminProducer.publishScheduleCreated(eventPayload);
   return "";
 };
+
+export const scheduleService = { createSchedule };
 ```
 
-Note `existingTrain.seats.length === 0` throws `BadRequestError("Train not found")` — a copy-pasted message; the actual condition being checked is "train has no seats", not "train doesn't exist" (that case is the `ConflictError` right above it). `createSchedule` returns an empty string `""`, not the created schedule or the event payload — a caller has no way to get the new schedule's id back from this function's return value alone (it would need to read it off the Kafka event or query separately).
+Note `existingTrain.seats.length === 0` still throws `BadRequestError("Train not found")` — a copy-pasted message that doesn't match the actual condition ("train has no seats", not "train doesn't exist" — that case is the `ConflictError` right above it). `createSchedule` still returns an empty string `""`, not the created schedule or the event payload. Neither of these was in scope for this fix pass — see [Known Issues](#known-issues--inconsistencies).
 
 `eventPayload`'s shape is defined by the `ScheduleCreatedPayload` interface in `admin.producer.ts` (see next section) — it's deliberately denormalized (train + seats + route all inlined) so inventory-service and search-service don't need to call back into admin-service to react to a new schedule.
 
@@ -800,9 +1018,26 @@ Note `existingTrain.seats.length === 0` throws `BadRequestError("Train not found
 
 ### 8. `kafka/producer/admin.producer.ts` — Event Publishing
 
-A thin class wrapping the shared Kafka producer with domain-specific publish methods:
+A thin class wrapping the shared Kafka producer with domain-specific publish methods. The `RouteCreatedPayload` interface is new this pass — it's what makes `publishRouteCreated`'s call site in `train.service.ts` type-check now that it's actually being called with a denormalized shape instead of a bare `Route`:
 
 ```typescript
+/**
+ * Denormalized route snapshot consumed by search-service's indexTrainRoute —
+ * it reads `train` (for trainId/trainNumber/trainName/seats) and
+ * `routeStations` (each including its related `station`) directly off this
+ * event, so both need to be inlined rather than just publishing the raw
+ * Prisma `Route` row.
+ */
+export interface RouteCreatedPayload extends Route {
+  train: Train & { seats: Seat[] };
+  routeStations: (RouteStation & { station: Station })[];
+}
+
+/**
+ * Denormalized schedule snapshot consumed by inventory-service and
+ * search-service — carries the seat map and route so those services
+ * don't need to call back into admin-service.
+ */
 export interface ScheduleCreatedPayload {
   scheduleId: string;
   trainId: string;
@@ -812,10 +1047,20 @@ export interface ScheduleCreatedPayload {
   totalSeats: number;
   departureDate: Date;
   status: ScheduleStatus;
-  seats: { seatId: string; seatNumber: number; seatType: SeatType; price: number }[];
+  seats: {
+    seatId: string;
+    seatNumber: number;
+    seatType: SeatType;
+    price: number;
+  }[];
   route: {
-    stationId: string; stationName: string; stationCode: string; city: string;
-    sequenceNumber: number; arrivalTime: string | null; departureTime: string | null;
+    stationId: string;
+    stationName: string;
+    stationCode: string;
+    city: string;
+    sequenceNumber: number;
+    arrivalTime: string | null;
+    departureTime: string | null;
     distanceFromOrigin: number;
   }[];
 }
@@ -832,7 +1077,14 @@ class AdminProducer {
 
   async publishStationCreated(station: Station) { /* keyed by station-<id> */ }
   async publishTrainCreated(trainData: Train) { /* keyed by train-<id> */ }
-  async publishRouteCreated(routeData: Route) { /* keyed by route-<id> */ }
+
+  /**
+   * Publishes a route-created event. Takes the denormalized
+   * RouteCreatedPayload (not a raw Prisma `Route`) so search-service's
+   * indexTrainRoute — which reads `train` and `routeStations` off the event
+   * directly — has everything it needs without calling back into this service.
+   */
+  async publishRouteCreated(routeData: RouteCreatedPayload) { /* keyed by route-<id> */ }
   async publishScheduleCreated(scheduleData: ScheduleCreatedPayload) { /* keyed by schedule-<scheduleId> */ }
   async publishScheduleCancelled(schedule: Schedule) { /* keyed by schedule-<id> */ }
 }
@@ -842,24 +1094,23 @@ export default new AdminProducer();
 
 The producer connects lazily on first use (`initialize()`), not at import time. Every `key` is derived from the entity's own id, so all events about the same entity land on the same Kafka partition and stay in order relative to each other.
 
-`publishScheduleCreated` takes the `ScheduleCreatedPayload` shape above — not a raw Prisma `Schedule` row — because `schedule.service.ts` needs to ship the denormalized train/seats/route data alongside the schedule itself (this method's signature was corrected in this pass; it previously required a plain `Schedule`, which didn't match what the service actually builds).
-
-Of the five publish methods, only `publishStationCreated` and `publishTrainCreated` are ever actually reached today:
-- `publishRouteCreated` is fully implemented, but its only call site (in `train.service.ts`'s `createRoute`) is commented out.
-- `publishScheduleCreated` is called correctly from `schedule.service.ts`, but that service is itself unreachable via HTTP (`schedule.route.ts` is never mounted — see Known Issue #16).
-- `publishScheduleCancelled` has no caller anywhere in this codebase.
+Of the five publish methods, four are now actually reached:
+- `publishStationCreated` and `publishTrainCreated` — unchanged, already worked before this pass.
+- `publishRouteCreated` — its call site in `train.service.ts`'s `createRoute` used to be commented out (and, as commented, wouldn't even have type-checked against the old signature, which expected a plain Prisma `Route`). It now fires correctly with a `RouteCreatedPayload`.
+- `publishScheduleCreated` — the call itself was always correct; it's now actually reachable because `schedule.route.ts` is mounted in `server.ts`.
+- `publishScheduleCancelled` still has **no caller anywhere** in this codebase — there's no cancel-schedule route, controller, or service. Out of scope for this fix pass; see Known Issues.
 
 ---
 
 ### 9. `middlewares/` & `utils/` — Cross-Cutting Helpers
 
-**`middlewares/cors.middleware.ts`** — whitelist check against `config.ALLOWED_ORIGINS` (comma-separated env var), credentials enabled, methods restricted to `GET/POST/PUT/DELETE/OPTIONS`.
+**`middlewares/cors.middleware.ts`** — whitelist check against `config.ALLOWED_ORIGINS` (comma-separated env var), credentials enabled, methods restricted to `GET/POST/PUT/DELETE/OPTIONS`. The origin list is built with `config.ALLOWED_ORIGINS ? config.ALLOWED_ORIGINS.split(",") : []`, so an unset `ALLOWED_ORIGINS` now safely resolves to an empty allow-list instead of throwing on `undefined.split(",")`.
 
-**`middlewares/error.middleware.ts`** — `AppError` instances are returned with their own status/code; anything else is logged to the console and returned as a generic `500 INTERNAL_SERVER_ERROR`.
+**`middlewares/error.middleware.ts`** — `AppError` instances are returned with their own status/code; anything else is logged to the console and returned as a generic `500 INTERNAL_SERVER_ERROR`. Unchanged.
 
-**`middlewares/req.middleware.ts`** — logs every request at `debug` on arrival, then logs method/path/status/duration at `info` once the response's `"finish"` event fires.
+**`middlewares/req.middleware.ts`** — logs every request at `debug` on arrival, then logs method/path/status/duration at `info` once the response's `"finish"` event fires. Unchanged.
 
-**`middlewares/user-context.middleware.ts`**:
+**`middlewares/user-context.middleware.ts`** (code unchanged from before — what changed is that it's now actually mounted):
 
 ```typescript
 export function getUserContext(
@@ -880,35 +1131,39 @@ export function getUserContext(
 }
 ```
 
-Two problems: this is never imported or mounted anywhere in `server.ts` or any route file, so it currently protects nothing; and `req.user = {...}` doesn't type-check, because admin-service has no `declare global { namespace Express { interface Request { user?: ... } } }` augmentation (unlike api-gateway's `auth.middleware.ts`, which has one). `npx tsc --noEmit` reports this as a real error today.
+Two things are fixed here: it's now imported and applied to every route in `station.route.ts`, `train.routes.ts`, and `schedule.route.ts` (before this pass, it was defined but never mounted anywhere, so it protected nothing); and `req.user = {...}` now type-checks, because of the new `types/express.d.ts` augmentation described above (before this pass, `npx tsc --noEmit` reported this as a real error). See [Lifecycle Case C](#case-c-any-route-with-no-x-user-id-header-auth-failure--new-behavior) for the resulting 401 flow.
 
-**`utils/api-response.ts`** — `SuccessResponse`/`ErrorResponse` helpers that wrap `res.json()` in a consistent `{ success, message, data? }` shape.
+**`utils/api-response.ts`** — `SuccessResponse`/`ErrorResponse` helpers that wrap `res.json()` in a consistent `{ success, message, data? }` shape. Unchanged.
 
-**`utils/asyncHandler.ts`** — wraps an async controller so a rejected promise is forwarded to `next()` instead of crashing the process; only works if the wrapped function's own promise actually rejects (see Lifecycle Case D for the case where it doesn't get the chance to).
+**`utils/asyncHandler.ts`** — wraps an async controller so a rejected promise is forwarded to `next()` instead of crashing the process. Unchanged.
 
-**`utils/error.ts`** — `AppError` base class plus `BadRequestError` (400), `UnauthorizedError` (401), `ForbiddenError` (403), `NotFoundError` (404), `ConflictError` (409), `TooManyRequestsError` (429), `InternalServerError` (500) — see the [Error Codes Reference](#error-codes-reference) for which of these are actually thrown anywhere.
+**`utils/error.ts`** — `AppError` base class plus `BadRequestError` (400), `UnauthorizedError` (401), `ForbiddenError` (403), `NotFoundError` (404), `ConflictError` (409), `TooManyRequestsError` (429), `InternalServerError` (500) — see the [Error Codes Reference](#error-codes-reference) for which of these are actually thrown anywhere. Unchanged.
 
-**`utils/zod.formatter.ts`** — takes a `ZodError` and returns just the first issue's message as a plain string (not the full list of validation errors).
+**`utils/zod.formatter.ts`** — takes a `ZodError` and returns just the first issue's message as a plain string (not the full list of validation errors). Unchanged.
 
 ---
 
 ## Environment Variables
 
-Variables actually read via `config.*` somewhere in `src/` (even though `config/index.ts` itself doesn't exist — see Known Issue #1):
+Variables actually read via `config.*` somewhere in `src/`, now that `config/index.ts` exists:
 
 ```bash
-PORT=                  # config/index.ts would need to provide this — no fallback visible in index.ts itself
-DATABASE_URL=          # read by config/prisma.ts, passed to the pg adapter
-KAFKA_BROKER=          # read by config/kafka.ts (falls back to "localhost:9093" if unset)
-KAFKA_CLIENT_ID=       # read by config/kafka.ts
-ALLOWED_ORIGINS=       # read by middlewares/cors.middleware.ts (comma-separated)
-LOG_LEVEL=             # read by config/logger.ts
-# SERVICE_NAME isn't an env var directly — config/logger.ts reads config.SERVICE_NAME,
-# which (based on the pattern in every other service in this repo) would normally come
-# from package.json's "name" field, not from .env
+PORT=4003              # config/index.ts: Number(process.env.PORT) || 4003
+NODE_ENV=development    # config/index.ts reads it into config.NODE_ENV, but nothing under
+                        # src/ reads config.NODE_ENV — config/prisma.ts checks the raw
+                        # process.env.NODE_ENV directly instead (see Known Issues)
+LOG_LEVEL=info          # read by config/logger.ts
+DATABASE_URL=           # read by config/prisma.ts, passed to the pg adapter
+ALLOWED_ORIGINS=        # read by middlewares/cors.middleware.ts (comma-separated, now
+                        # undefined-safe)
+KAFKA_BROKER=           # read by config/kafka.ts (falls back to "localhost:9093" if unset)
+KAFKA_CLIENT_ID=        # read by config/kafka.ts
+INTERNAL_SERVICE_KEY=   # read into config.INTERNAL_SERVICE_KEY, but nothing under src/
+                        # reads that field yet — currently unused (see Known Issues)
+# SERVICE_NAME isn't an env var — config/index.ts reads it from package.json's own "name" field
 ```
 
-The actual `.env` file in this project also defines a long list of variables that nothing under `admin-service/src` reads: `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, `ACCESS_TOKEN_EXP`, `ACCESS_TOKEN_EXP_SEC`, `REFRESH_TOKEN_EXP`, `REFRESH_TOKEN_EXP_SEC`, `OTP_HMAC_SECRET`, `OTP_MAX_VERIFY_ATTEMPTS`, `OTP_RATE_MAX_PER_HOUR`, `OTP_TTL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `MONGODB_URI`, `INTERNAL_SERVICE_KEY`, `REDIS_URL`, `REDIS_USER_TTL`, `SENDGRID_API_KEY`, `MAIL_SEND`, `RESEND_API_KEY` — these look like they belong to an auth/OTP/notification service, not this one (see Known Issues).
+`.env.example` is new this pass and defines exactly these variables with concrete local-dev values (`PORT=4003`, a local Postgres connection string, `localhost:9093` for Kafka, etc.) — and nothing else. There is no `.env` committed in this project; anyone running the service locally needs to copy `.env.example` to `.env` themselves. This is a change from the state this doc previously described, where a stale `.env` was said to define a long list of unrelated JWT/OTP/Mongo/Redis/SendGrid variables — that file isn't present in the project as it stands now.
 
 ---
 
@@ -917,10 +1172,10 @@ The actual `.env` file in this project also defines a long list of variables tha
 | Class | Status | Thrown by, in this codebase |
 |---|---|---|
 | `BadRequestError` | 400 | `train.controller.ts` (empty seats/stations — unreachable in practice), `train.service.ts` (duplicate seat numbers; invalid station ids; non-contiguous sequence numbers), and `schedule.service.ts` (no seats, no route, bad date) |
-| `UnauthorizedError` | 401 | `user-context.middleware.ts` — but that middleware is never mounted, so this never actually fires |
+| `UnauthorizedError` | 401 | `user-context.middleware.ts` — now mounted on every route in this service (station, train, schedule), so this fires for real whenever `x-user-id` is missing. Before this pass it was defined but never mounted, so it never fired |
 | `ForbiddenError` | 403 | — (defined, not thrown anywhere) |
-| `NotFoundError` | 404 | `train.service.ts` — correctly in `getTrainById` (train doesn't exist), and *incorrectly* in `createRoute`'s inverted "already exists" check (see Known Issue #14) |
-| `ConflictError` | 409 | `station.service.ts` (duplicate code), `train.service.ts` (duplicate train number), and `schedule.service.ts` (train not found; duplicate schedule for the same date) |
+| `NotFoundError` | 404 | `train.service.ts` — `getTrainById` (train doesn't exist) and `createRoute` (train doesn't exist). The previous *incorrect* use of `NotFoundError` for "route already exists" is gone — that path now throws `ConflictError` instead (see Known Issues history) |
+| `ConflictError` | 409 | `station.service.ts` (duplicate code), `train.service.ts` (duplicate train number, and now also route already exists for this train), and `schedule.service.ts` (train not found — a copy-pasted use of `ConflictError` for a not-found case; duplicate schedule for the same date) |
 | `TooManyRequestsError` | 429 | — (defined, not thrown anywhere — no rate limiting in this service) |
 | `InternalServerError` | 500 | — (defined, not thrown — `error.middleware.ts` builds its own 500 response inline instead, same pattern as the API Gateway) |
 
@@ -936,10 +1191,12 @@ All topic names come from `shared/constants/kafka-topics.ts`, shared across ever
 |---|---|---|
 | `admin.station-created` | `stationService.createStation` | ✅ yes |
 | `admin.train-created` | `trainService.createTrain` | ✅ yes |
-| `admin.route-created` | — | ❌ `adminProducer.publishRouteCreated` exists and is implemented; its only call site in `trainService.createRoute` is commented out |
-| `admin.schedule-created` | `scheduleService.createSchedule` | ⚠️ the publish call itself is correct, but nothing can reach `createSchedule` via HTTP — `schedule.route.ts` is never mounted in `server.ts` |
-| `admin.schedule-cancelled` | — | ❌ `adminProducer.publishScheduleCancelled` exists but nothing calls it |
+| `admin.route-created` | `trainService.createRoute` | ✅ yes — fixed this pass. `adminProducer.publishRouteCreated` was already implemented, but its only call site (in `trainService.createRoute`) used to be commented out; it now fires with a denormalized `RouteCreatedPayload` |
+| `admin.schedule-created` | `scheduleService.createSchedule` | ✅ yes — the publish call itself was always correct, but `schedule.route.ts` wasn't mounted in `server.ts` before this pass, so nothing could reach `createSchedule` via HTTP. It's mounted now |
+| `admin.schedule-cancelled` | — | ❌ `adminProducer.publishScheduleCancelled` exists but nothing calls it — there's no cancel-schedule route/controller/service anywhere in this codebase. Out of scope for this fix pass |
 | `admin.train-updated`, `admin.station-updated`, `admin.route-updated` | — | ❌ defined in the shared constants file, no producer method for any of them exists here |
+
+This service is a pure Kafka **producer** — it has no consumer anywhere. It never subscribes to any topic; it only ever publishes.
 
 ---
 
@@ -948,35 +1205,41 @@ All topic names come from `shared/constants/kafka-topics.ts`, shared across ever
 ```bash
 cd admin-service
 npm install
-npx prisma generate     # regenerates src/generated/prisma from prisma/schema.prisma
+cp .env.example .env     # no .env is committed — copy the example and adjust as needed
+npx prisma generate       # regenerates src/generated/prisma from prisma/schema.prisma
 
-# .env needs at least DATABASE_URL, KAFKA_BROKER, KAFKA_CLIENT_ID, ALLOWED_ORIGINS
-npm run dev              # nodemon + ts-node, hot reload
+npm run dev                # nodemon + ts-node, hot reload
 ```
 
-**As checked in today, this fails immediately** — see [Known Issue #1](#known-issues--inconsistencies). `npx tsc --noEmit` from `admin-service/` will show the missing-module errors without even needing a running database or Kafka broker.
+`npx tsc --noEmit` from `admin-service/` reports zero errors as of this pass. That's a static guarantee only — this service has **not** been run against a live Postgres instance or Kafka broker in the environment this fix pass ran in, so the requests below are shown as what the code is written to do, not as independently confirmed end-to-end behavior.
 
-Once the missing `config/index.ts` (and, if still referenced, `config/db.ts`) are restored, the intended requests are:
+Every route below now requires an `x-user-id` header (see [Known Issue #12](#known-issues--inconsistencies) for what that header does and doesn't verify):
 
 ```bash
-curl -X POST http://localhost:<PORT>/stations/station \
+curl -X POST http://localhost:4003/stations/station \
   -H "Content-Type: application/json" \
+  -H "x-user-id: 11111111-1111-1111-1111-111111111111" \
   -d '{"name":"New Delhi","code":"ndls","city":"Delhi","state":"Delhi"}'
 
-curl -X POST http://localhost:<PORT>/trains/train \
+curl -X POST http://localhost:4003/trains/train \
   -H "Content-Type: application/json" \
+  -H "x-user-id: 11111111-1111-1111-1111-111111111111" \
   -d '{"trainNumber":"12301","trainName":"Rajdhani Express","coachName":"AC","seats":[{"seatNumber":1,"seatType":"LOWER","price":1500}]}'
 
-# This will 404 with "Route already existis for this train" for any train
-# that doesn't already have one — see Known Issue #14.
-curl -X POST http://localhost:<PORT>/trains/route \
+# Now succeeds for a brand-new train (the existence-check inversion is fixed):
+curl -X POST http://localhost:4003/trains/route \
   -H "Content-Type: application/json" \
+  -H "x-user-id: 11111111-1111-1111-1111-111111111111" \
   -d '{"trainId":"<train-uuid>","stations":[{"stationId":"<station-uuid-1>","sequenceNumber":1,"departureTime":"06:10"},{"stationId":"<station-uuid-2>","sequenceNumber":2,"arrivalTime":"10:00"}]}'
 
-# There is currently no route to this endpoint at all — schedule.route.ts
-# is never mounted in server.ts (Known Issue #16). Shown for reference only:
-curl -X POST http://localhost:<PORT>/schedule \
+# Now works — the routing bug is fixed and the param name matches:
+curl http://localhost:4003/trains/train/<train-uuid> \
+  -H "x-user-id: 11111111-1111-1111-1111-111111111111"
+
+# Now reachable — schedule.route.ts is mounted at /schedules in server.ts:
+curl -X POST http://localhost:4003/schedules/schedule \
   -H "Content-Type: application/json" \
+  -H "x-user-id: 11111111-1111-1111-1111-111111111111" \
   -d '{"trainId":"<train-uuid>","departureDate":"2026-08-01"}'
 ```
 
@@ -984,43 +1247,34 @@ curl -X POST http://localhost:<PORT>/schedule \
 
 ## Debugging Tips
 
-- **`Cannot find module './config'` (or `'../config'`, `'.'`, `'./index'`) on startup or in `tsc`** → `src/config/index.ts` doesn't exist in this project yet; every config-dependent file (and `index.ts` itself) needs it. See Known Issue #1.
-- **A duplicate-station request returns 200 `"OTP sent successfully"` instead of a 409** → `station.controller.ts` doesn't await the service call; check the server's own logs for an unhandled promise rejection mentioning `"Station already exists"` rather than trusting the HTTP response. See Lifecycle Case D.
-- **A station's Kafka event never arrives even though the row exists in Postgres** → `stationService.createStation`'s publish isn't wrapped in a `.catch` (unlike the train service's); check for a Kafka connection error in the logs around the time of that request.
-- **`POST /trains/route` always 404s with `"Route already existis for this train"`, even for a brand-new train** → `trainService.createRoute`'s existing-route check is inverted; see Lifecycle Case B and Known Issue #14. This isn't a data problem — it fails the same way for every train that doesn't already have a route.
-- **`POST /trains/route/:id` always 400s with `"Train Id is missing"`** → the route param is `:id`, but `getTrainById`'s controller reads `req.params.trainId`; it's also mounted as `POST` instead of `GET`. See Known Issue #13.
-- **`POST /schedule` (or any path you'd expect for schedule creation) 404s no matter what** → `schedule.route.ts` is never imported/mounted in `server.ts`. The feature is fully implemented in `schedule.controller.ts`/`schedule.service.ts` but unreachable from outside the process. See Known Issue #16.
-- **Nothing ever seems to require authentication** → `getUserContext` exists in `middlewares/user-context.middleware.ts` but isn't mounted in `server.ts` or any route file — there's no auth in this service today.
-- **`tsc` complains about `req.user` not existing** → admin-service has no `Express.Request` type augmentation, unlike api-gateway's `auth.middleware.ts`. `user-context.middleware.ts`'s `req.user = {...}` assignment doesn't type-check as a result.
+- **Any request returns 401 `"User context missing - must come through gateway"`** → `getUserContext` is now mounted on every route in this service; set an `x-user-id` header, or route the request through api-gateway, whose `requireAuth` sets that header after real JWT verification. Calling admin-service directly (bypassing the gateway) means you're responsible for setting this header yourself — admin-service does no verification of its own. See Lifecycle Case C and Known Issue #12.
+- **A duplicate-station request now correctly returns 409** → `station.controller.ts`'s `createStation` awaits the service call (fixed this pass); if you ever see a 200 for a duplicate station code again, something has regressed. See Lifecycle Case D.
+- **A station's Kafka event never arrives even though the row exists in Postgres** → `stationService.createStation`'s publish isn't wrapped in a `.catch` (unlike the train/route services); check for a Kafka connection error in the logs around the time of that request. Since the controller now awaits this call, a broker outage here will also surface to the client as a 500, not just silently vanish.
+- **`POST /trains/route` now succeeds for a brand-new train** → the inverted existence check is fixed; if it 409s, that means a route genuinely already exists for that train (`Route.trainId` is `@unique`). See Lifecycle Case B.
+- **`GET /trains/train/:trainId` now works** → mounted correctly with a matching param name; a 404 here means `trainService.getTrainById` genuinely didn't find that id, not a routing bug.
+- **`POST /schedules/schedule` 404s** → double check the full path — `schedule.route.ts` is mounted at `/schedules` in `server.ts` and itself defines `POST /schedule`, so the combined path is `/schedules/schedule`, easy to typo as just `/schedule`.
+- **A schedule's Kafka event never arrives even though the row exists in Postgres** → unlike train/route creation, `scheduleService.createSchedule`'s publish isn't wrapped in a `.catch` — a broker failure here throws and would surface as a 500.
+- **Nothing about "cancel a schedule" works, and there's no route for it** → there's no cancel-schedule feature built. `adminProducer.publishScheduleCancelled` exists but has no caller anywhere. See Known Issues.
 - **A request to `/trains/train` with duplicate seat numbers in the payload returns a 400** → that's `trainService.createTrain`'s own dedup check (`new Set(seatNumbers).size !== seatNumbers.length`), separate from anything Zod validates.
+- **`tsc` fails locally even though this doc says it's clean** → make sure `npx prisma generate` has been run so `src/generated/prisma` exists; the generated client isn't checked into the repo.
+- **Requests routed through api-gateway to `/admins/stations/station` or `/admins/trains/train` still 404** → that's a pre-existing, still-unfixed mismatch: the gateway registers those as `GET`, admin-service only defines `POST`. Unrelated to anything fixed in this pass. See Known Issue #4.
 
 ---
 
 ## Known Issues & Inconsistencies
 
-Observed while reviewing the code — documented here rather than fixed, since these are informational (same approach as the API Gateway's and Notification Service's docs):
+Observed while reviewing the current code — documented here rather than fixed, since these are informational (same approach as the API Gateway's and Notification Service's docs). Several issues that were present the last time this doc was written have been fixed in this pass and are called out inline in the sections above rather than repeated here; what follows is what's still actually true today.
 
-1. **The service doesn't compile.** `src/index.ts` imports `./config` and `./config/db`; `src/config/kafka.ts`, `src/config/logger.ts`, `src/config/prisma.ts`, and `src/middlewares/cors.middleware.ts` each import a `config` object from `.`/`../config`/`./index` (all resolving to `src/config/index.ts`). None of these files exist anywhere in this project. Confirmed with `npx tsc --noEmit`, which reports six "Cannot find module" errors plus one unrelated type error (#3 below).
-2. **Import/env-load ordering**: even once `config/index.ts` exists, `index.ts` imports it (and everything that reads `config.*` at module-eval time) before calling `dotenv.config()` on line 6. If the restored config object reads `process.env.X` directly at module load (as the equivalent files do in every other service in this repo), `.env`-only values would be `undefined` at that point.
-3. **`req.user` doesn't type-check.** `middlewares/user-context.middleware.ts` assigns `req.user = {...}`, but nothing in this project declares the `Express.Request.user` augmentation that api-gateway's `auth.middleware.ts` declares for itself. `npx tsc --noEmit` reports this as `Property 'user' does not exist on type 'Request<...>'`.
-4. **No authentication is wired up anywhere.** `getUserContext` (in `user-context.middleware.ts`) is fully implemented but never imported into `server.ts` or any route file. Anything that can reach this service's HTTP port can create stations, trains, and routes.
-5. **`station.controller.ts`'s `createStation` never awaits (or returns) `stationService.createStation(...)`.** The 200 response is sent before the DB write / Kafka publish settle, and a rejection (e.g. `ConflictError` on a duplicate code) becomes an unhandled promise rejection instead of reaching `errorHandler`. See Lifecycle Case D.
-6. **The station-creation success message is `"OTP sent successfully"`** — leftover text from a different (OTP/auth) flow this controller was evidently adapted from.
-7. **Inconsistent Kafka failure handling**: `stationService.createStation` lets a publish failure throw (which, combined with #5, currently just becomes an unhandled rejection); `trainService.createTrain` catches and logs the same kind of failure instead. The same class of side effect is handled two different ways.
-8. **`src/types/index.ts` defines `KnowledgeDoc` and `RAGResponse`**, referencing `mongoose` — a document-embedding/RAG shape with no relation to stations, trains, routes, or schedules. Nothing under `src/` imports either interface.
-9. **Unrelated dependencies in `package.json`**: `@langchain/cohere`, `@langchain/core`, `@langchain/groq`, `@langchain/openai`, `mongoose`, `otp-generator`, `resend` are all listed, but nothing under `src/` (excluding the unused `types/index.ts` above) imports any of them. Together with #8, this looks like the project was scaffolded from a shared template without trimming unused pieces.
-10. **`.env` defines variables nothing in this codebase reads**: `JWT_ACCESS_SECRET`, `JWT_REFRESH_SECRET`, `ACCESS_TOKEN_EXP(_SEC)`, `REFRESH_TOKEN_EXP(_SEC)`, `OTP_HMAC_SECRET`, `OTP_MAX_VERIFY_ATTEMPTS`, `OTP_RATE_MAX_PER_HOUR`, `OTP_TTL`, `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `MONGODB_URI`, `INTERNAL_SERVICE_KEY`, `REDIS_URL`, `REDIS_USER_TTL`, `SENDGRID_API_KEY`, `MAIL_SEND`, `RESEND_API_KEY` — these read like they belong to a user/auth/notification service rather than this one.
-11. **`npm run seed` points at `src/services/seed.ts`**, which doesn't exist in this project — running that script fails. The same issue is already flagged in the API Gateway's and Notification Service's docs, likely from a shared `package.json` origin.
-12. **Cross-service routing mismatch**: `api-gateway/src/routes/index.ts` registers `/admins/stations/station` and `/admins/trains/train` as `GET`, but this service only defines `POST` for both paths — requests routed through the gateway to either endpoint 404 today. (Also flagged in the API Gateway's own docs/review.)
-13. **`trainController.getTrainById` is unreachable as routed.** It's mounted at `POST /trains/route/:id` (wrong verb for a read, and a path that reads like "get a route" rather than "get a train"). Worse, the controller destructures `req.params.trainId`, but the route param is named `:id` — so `trainId` is always `undefined` and the handler always 400s with "Train Id is missing" before `trainService.getTrainById` runs.
-14. **`trainService.createRoute`'s existing-route check is inverted.** `if (!existingRoute) throw new NotFoundError("Route already existis for this train")` throws "already exists" exactly when no route exists yet, meaning no train can ever get its first route created through this endpoint. If a route *did* already exist, execution instead falls through to `prisma.route.create`, which would throw a raw Prisma unique-constraint error (`Route.trainId` is `@unique`) rather than a clean `ConflictError`. See Lifecycle Case B.
-15. **`trainService.createRoute`'s planned `publishRouteCreated` call is commented out**, and as written wouldn't type-check if uncommented — it builds a `{ ...route, train: trainWithSeats }` object, but `adminProducer.publishRouteCreated` expects a plain Prisma `Route`.
-16. **`schedule.route.ts` is never mounted.** `server.ts` only imports and `app.use()`s `station.route.ts` and `train.routes.ts` — there is no `app.use(..., scheduleRoutes)` anywhere. The entire schedule-creation feature (`schedule.controller.ts`, `schedule.service.ts`, and the Kafka publish it triggers) is fully implemented but unreachable via HTTP.
-17. **`schedule.controller.ts` imports `zRoute` and `zTrain` from `../types/zod` but uses neither** — likely copied from `train.controller.ts` as a starting point and not trimmed.
-18. **`scheduleController.createSchedule`'s success message is `"Train created successfully"`** — copy-pasted from `train.controller.ts`, describes the wrong resource.
-19. **`scheduleService.createSchedule` returns `""`** (an empty string) rather than the created schedule or the event payload it just built and published — a caller has no way to get the new schedule back from the return value.
-20. **`scheduleService.createSchedule`'s "train has no seats" check throws a copy-pasted message**: `if (existingTrain.seats.length === 0) throw new BadRequestError("Train not found")` — the message says "not found" for a train that clearly *was* found (it's already been fetched); the actual problem is that it has zero seats.
-21. **Minor message typos, left as-is**: `train.service.ts`'s `createRoute` says `"Sequence Numbers must be continous starting free"` (should read something like "starting from 1"), and its inverted-check message itself has a typo, `"existis"`.
-22. **No read/list/update/delete endpoints exist** for stations, and none work for trains (`getTrainById` is broken per #13) — only creation (and, for routes, a creation endpoint that always fails per #14). There's no way to actually look up an existing station, train, route, or schedule through this service's API today.
+1. **This fix pass has only been verified statically.** `npx tsc --noEmit` reports zero errors, but no Postgres instance or Kafka broker was reachable in the environment these changes were made in — none of the flows in this document have been run end-to-end against a live database or broker. Treat "works when called" as "the logic reads correctly and the types check," not as confirmed runtime behavior.
+2. **`admin.schedule-cancelled` still has no caller anywhere.** No cancel-schedule route, controller, or service exists — `adminProducer.publishScheduleCancelled` is fully implemented but dead code. Building this was out of scope for this fix pass.
+3. **Cross-service routing mismatch, unchanged by this pass**: `api-gateway/src/routes/index.ts` registers `/admins/stations/station` and `/admins/trains/train` as `GET`, but admin-service only defines `POST` for both — requests routed through the gateway to either endpoint still 404 today. Worth noting, though: api-gateway's `requireAuth` middleware does correctly set `x-user-id` before proxying, so admin-service's newly-enforced `getUserContext` requirement would already be satisfied for gateway-routed traffic once/if the verb mismatch itself gets fixed.
+4. **Unrelated dependencies remain in `package.json`**: `@langchain/cohere`, `@langchain/core`, `@langchain/groq`, `@langchain/openai`, `mongoose`, `otp-generator`, `resend`, `bcrypt`, `jsonwebtoken`, `ioredis`, `http-status` are all still listed, and a repo-wide check in this pass confirms nothing under `src/` imports any of them — not even now that `types/index.ts` (which used to import `mongoose`) has been deleted. The package.json itself wasn't trimmed.
+5. **`npm run seed` still points at `src/services/seed.ts`**, which still doesn't exist — running that script still fails. The same issue is flagged in the API Gateway's and Notification Service's docs, likely from a shared `package.json` origin.
+6. **`config.NODE_ENV` is defined but nothing reads it.** `config/prisma.ts` checks the raw `process.env.NODE_ENV` directly (`if (process.env.NODE_ENV !== "production")`) instead of going through `config.NODE_ENV` — both currently resolve to the same value, so this is an inconsistency rather than a bug, but it means the `config` object isn't the single source of truth it looks like it should be.
+7. **`config.INTERNAL_SERVICE_KEY` is read into the config object, but nothing under `src/` reads `config.INTERNAL_SERVICE_KEY` anywhere.** It looks like groundwork for a future internal-service-to-service auth check (e.g. verifying a shared secret on requests that don't come through the gateway) that hasn't been wired up yet.
+8. **`scheduleService.createSchedule` still returns `""`** (an empty string), not the created schedule or the event payload it just built and published — a caller still has no way to get the new schedule back from this function's return value alone.
+9. **`scheduleService.createSchedule`'s "train has no seats" check still throws a copy-pasted message**: `if (existingTrain.seats.length === 0) throw new BadRequestError("Train not found")` — the message says "not found" for a train that was clearly just found; the real condition is "has zero seats." Not touched in this pass.
+10. **No read/list/update/delete endpoints exist for stations**, and there's still no update/delete for trains, routes, or schedules. `getTrainById` is the only working read endpoint in the entire service today.
+11. **`getUserContext` trusts the `x-user-id` header at face value.** It doesn't verify a JWT itself — it just checks the header is present and 401s if not. This is the same trust-the-gateway model used elsewhere in this repo (api-gateway does the real JWT verification and sets the header before proxying), but it's worth knowing explicitly: anything that can set that header directly — a misconfigured proxy, or a caller hitting admin-service's port without going through the gateway — can claim to be any user id.
 
 None of the above are being changed as part of this documentation pass — flagging them here so they're visible next time someone works on this service.

@@ -1,17 +1,47 @@
-import { Router } from "express";
-import { trainController } from "../controllers/train.controller";
+import { Router, Request, Response, NextFunction } from "express";
+import { inventoryController } from "../controllers/inventory.controller";
+import { getUserContext } from "../middlewares/user-context.middleware";
+import { internalAuth } from "../middlewares/internal-auth.middleware";
+import { config } from "../config";
 
 const router = Router();
 
-// Mounted at /trains in server.ts. No auth/user-context middleware is
-// applied here — anything that can reach this service can create a train
-// or a route.
-router.post("/train", trainController.createTrain); // POST /trains/train — create train + seats
-router.post("/route", trainController.createRoute); // POST /trains/route — define a train's route
-// POST /trains/route/:id — intended as "get train by id", but broken: this
-// should be a GET, and the param is named :id while the controller reads
-// req.params.trainId, so it's always undefined. See trainController
-// .getTrainById's doc comment for the full picture.
-router.post("/route/:id", trainController.getTrainById);
+/**
+ * Allows either an end-user request that's already passed through the
+ * gateway (x-user-id header) or a direct internal-service call (shared
+ * secret header) — booking-service needs to read seat status without a
+ * logged-in user's JWT in hand.
+ */
+function userOrInternal(req: Request, res: Response, next: NextFunction) {
+  const serviceKey = req.headers["x-internal-service-key"];
+  if (serviceKey && serviceKey === config.INTERNAL_SERVICE_KEY) {
+    req.user = { id: "internal-service" };
+    return next();
+  }
+  return getUserContext(req, res, next);
+}
+
+// Public: aggregate availability (used by search results)
+router.get(
+  "/schedules/:scheduleId/availability",
+  inventoryController.getScheduleAvailability,
+);
+
+// Authenticated OR internal: individual seat statuses
+router.get(
+  "/schedules/:scheduleId/seats",
+  userOrInternal,
+  inventoryController.getScheduleSeats,
+);
+
+// Internal only: called by booking-service during the create/cancel-booking saga
+router.post("/seats/lock", internalAuth, inventoryController.lockSeats);
+router.post("/seats/unlock", internalAuth, inventoryController.unlockSeats);
+router.post("/seats/confirm", internalAuth, inventoryController.confirmSeats);
+router.post(
+  "/seats/cancel-booking",
+  internalAuth,
+  inventoryController.cancelBooking,
+);
 
 export default router;

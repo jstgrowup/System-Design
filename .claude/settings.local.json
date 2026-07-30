@@ -1,7 +1,9 @@
 {
   "permissions": {
     "allow": [
-      "Bash(npm init *)"
+      "Bash(npm init *)",
+      "Read(//home/subham/E/System-Design/irctc-backend-main/shared/**)",
+      "Read(//home/subham/E/System-Design/irctc-backend-main/shared/constants/**)"
     ]
   }
 }

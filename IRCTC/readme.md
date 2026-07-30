@@ -80,11 +80,12 @@ on exactly where and why in section 6.
 | Service                                    | Port               | What it's _for_, in plain words                                                                                                                                                                        | Right now                                                                                           |
 | ------------------------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
 | **API Gateway**                            | 4000               | The receptionist. Every request from the outside world is supposed to knock here first — it checks your login token, makes sure you're not spamming the server, and forwards you to the right service. | ✅ Runs, but only 2 routes are wired up, and both are currently broken (see §6)                     |
-| **User Service**                           | 4001               | Handles "who are you." Signup (with an email OTP), login, and issuing/renewing the tokens that prove you're logged in.                                                                                 | ✅ The auth part works well and is thoroughly tested/documented. Profile editing is unbuilt.        |
-| **Admin Service**                          | 4003               | The back office. Where railway staff would add new stations, trains, the route a train follows, and which dates it runs.                                                                               | ❌ Currently fails to even start — two files it needs are missing                                   |
-| **Search Service**                         | 4002               | The "find a train" feature, backed by Elasticsearch instead of the regular database, for fast searching.                                                                                               | ❌ Currently fails to even start — a route file it needs is missing                                 |
+| **User Service**                           | 4001               | Handles "who are you." Signup (with an email OTP), login, issuing/renewing the tokens that prove you're logged in, and profile editing.                                                                | ✅ The auth part works well and is thoroughly tested/documented. Profile editing is now built too (was unbuilt/unmounted) — not verified live. |
+| **Admin Service**                          | 4003               | The back office. Where railway staff would add new stations, trains, the route a train follows, and which dates it runs.                                                                               | ✅ Code complete, typechecks. ⚠️ Not verified live (no reachable DB/Kafka in this environment)      |
+| **Search Service**                         | 4002               | The "find a train" feature, backed by Elasticsearch instead of the regular database, for fast searching.                                                                                               | ✅ Code complete, typechecks. ⚠️ Not verified live (no reachable Elasticsearch/Kafka in this environment) |
 | **Notification Service**                   | 4004               | A background worker with no real webpage of its own. It just listens for "someone needs an email" announcements on Kafka and sends them.                                                               | ✅ Runs correctly as designed                                                                       |
-| **Booking / Payment / Inventory Services** | 4005 / 4006 / 4007 | Would handle seat booking, payments, and live seat availability.                                                                                                                                       | ❌ Don't exist in this repository — only their _names_ and Kafka topics are reserved for the future |
+| **Inventory Service**                      | 4007               | Tracks how many seats are left on a train's schedule (available/locked/booked), including partial-journey seat locking so two passengers can share a seat across non-overlapping legs.                | ✅ Code complete, typechecks. ⚠️ Not verified live (no reachable DB/Kafka in this environment) — can now receive real events from Admin Service in principle, see §5 |
+| **Booking / Payment Services**             | 4005 / 4006        | Would handle seat booking and payments.                                                                                                                                                                 | ❌ Don't exist in this repository — only their _names_ and Kafka topics are reserved for the future |
 
 Everything is written in **TypeScript** with **Express** (a web framework),
 and each service is its own standalone program with its own `package.json` —
@@ -164,9 +165,9 @@ A couple of details worth knowing, in plain English:
   the real user already refreshed, the server notices the mismatch and kills
   the whole session — forcing a fresh login. This defends against stolen
   tokens.
-- A **welcome email** is defined and fully ready to send in the Notification
-  Service, but nothing in the User Service ever actually asks for one to be
-  sent — so today, no welcome email ever goes out after signup.
+- A **welcome email** is defined and ready to send in the Notification
+  Service. The User Service now actually asks for one after a successful
+  signup — this used to never happen, but hasn't been watched working live yet.
 
 The complete, byte-for-byte breakdown of this flow (every error code, every
 Redis key, every security decision and why) lives in
@@ -200,24 +201,29 @@ sequenceDiagram
     Note over S,ES: nothing listens for this one today —<br/>trains alone aren't enough to search a journey,<br/>you also need the route
 
     Staff->>A: POST /trains/route {trainId, stations...}
-    Note over A: ❌ this endpoint currently always fails<br/>with "Route already exists" — even for<br/>a train that has never had a route.<br/>An if-check was written backwards.
+    A->>DB: Save the route
+    A->>K: "A new route was created" (train + route inlined)
 ```
 
-**This is the flow that's supposed to happen.** In the actual code today,
-almost none of it can run at all, because **the Admin Service currently
-fails to start** — it's missing two files (`config/index.ts` and
-`config/db.ts`) that other files in the project assume exist. Even once
-that's fixed, defining a route for a train is broken (the bug shown above),
-and creating a _schedule_ (a specific date a train runs) is fully written
-but was never connected to any URL, so it can't be reached from outside the
-process at all.
+**This is the flow that's supposed to happen, and the Admin Service side of it
+now works** — it used to fail to start entirely (`config/index.ts` existed but
+was empty, and it imported a `config/db.ts` that never existed anywhere in the
+project), `createRoute`'s existence check was inverted (blocking every train's
+first route), and the `ROUTE_CREATED` publish was commented out. All three are
+fixed now, and creating a _schedule_ (a specific date a train runs) is
+connected to a real URL for the first time. **None of this has been run
+against a live Postgres/Kafka**, though — it's verified only by `tsc --noEmit`
+passing clean, in an environment with no reachable database or broker.
 
-The **Search Service** has the opposite problem: its own code that would
-_read_ search requests (`searchTrains`, `autocompleteStation`, etc.) is fully
-written and correct, but there's no web route pointing at it, **and** the
-service itself currently fails to start for an unrelated reason (a missing
-file it tries to import). So even the one Kafka event that _does_ fire
-correctly (`admin.station-created`) has nowhere to land right now.
+**The Search Service side is fixed too now.** Its `searchTrains` handler used to
+compute a real result and then discard it for a hardcoded message; `debug/stations`
+and `debug/trains` both called the wrong function (a copy-paste bug); the service
+also carried three dead files left over from an earlier scaffold that referenced
+config values that don't exist, which silently blocked the whole service from
+compiling even though nothing actually used them. All of that is fixed —
+**but still not verified against a live Elasticsearch or Kafka**, so treat
+"Admin Service publishes it, Search Service can index it" as true on paper, not
+as something actually observed working end-to-end.
 
 ---
 
@@ -300,6 +306,7 @@ flowchart LR
     subgraph Publishers["Services that ANNOUNCE things"]
         US2["User Service"]
         AS2["Admin Service"]
+        IS2["Inventory Service"]
     end
 
     subgraph Topics["Kafka Topics (channels)"]
@@ -309,37 +316,48 @@ flowchart LR
         T4["admin.train-created"]
         T5["admin.route-created"]
         T6["admin.schedule-created"]
-        T7["booking.* / payment.* /<br/>inventory.* topics"]
+        T8["inventory.seat-availability-updated"]
+        T7["booking.* / payment.* topics"]
     end
 
     subgraph Listeners["Services that LISTEN for things"]
         NS2["Notification Service"]
         SS2["Search Service"]
+        IS2L["Inventory Service"]
     end
 
     US2 -->|"actually publishes"| T1 --> NS2
     US2 -.->|"defined, but never<br/>actually published"| T2
     T2 -.-> NS2
 
-    AS2 -->|"actually publishes"| T3 --> SS2
-    AS2 -->|"actually publishes"| T4
+    AS2 -->|"publishes"| T3 --> SS2
+    AS2 -->|"publishes"| T4
     Note1["(nothing listens for train-created yet)"]
     T4 --- Note1
 
-    AS2 -.->|"code to publish this is<br/>written but commented out"| T5
-    T5 -.-> SS2
+    AS2 -->|"publishes"| T5 --> SS2
 
-    AS2 -.->|"the HTTP route that would\ntrigger this is never turned on"| T6
-    T6 -.-> SS2
+    AS2 -->|"publishes"| T6
+    T6 --> SS2
+    T6 --> IS2L
 
-    T7 -.->|"nobody publishes these —<br/>booking/payment/inventory\nservices don't exist yet"| T7b["(nobody's listening either)"]
+    IS2 -->|"publishes"| T8 --> SS2
+
+    T7 -.->|"nobody publishes these —<br/>booking/payment\nservices don't exist yet"| T7b["(nobody's listening either)"]
 ```
 
-**The short version:** the only Kafka announcement that reliably travels
-from one real service to another today is `admin.station-created` (Admin →
-Search) and `notification.otp-email` (User → Notification). Everything else
-on this board is either half-wired, fully unreachable, or reserved for
-services that haven't been written yet.
+**The short version:** as of this pass, admin-service, search-service, and
+inventory-service all build and typecheck, so every solid arrow above is now
+structurally wired end-to-end at the code level — `admin.station-created`,
+`admin.route-created`, and `admin.schedule-created` all leave Admin Service
+correctly, and both Search Service and Inventory Service have real handlers
+waiting for them. **None of this has actually been observed working**,
+though — this was verified with `tsc --noEmit` in a sandbox with no reachable
+Postgres, Elasticsearch, or Kafka, so treat the solid arrows as "should work"
+rather than "confirmed working." `notification.otp-email` (User → Notification)
+remains the one flow anyone has actually watched succeed. Dotted lines are
+still genuinely unbuilt: `notification.welcome-email` has no caller, and
+`booking.*`/`payment.*` have no publisher because those services don't exist yet.
 
 ---
 
@@ -347,12 +365,13 @@ services that haven't been written yet.
 
 | Service                       | Starts up?                  | Fully reachable end-to-end?                            | Biggest reason why not                                         |
 | ----------------------------- | --------------------------- | ------------------------------------------------------ | -------------------------------------------------------------- |
-| API Gateway                   | ✅ Yes                      | ⚠️ Only 2 routes exist, and both 404                   | Path mismatch + a never-mounted route on the User Service side |
+| API Gateway                   | ✅ Yes                      | ⚠️ Only 2 routes exist, and both 404                   | Path mismatch on login; a GET/POST method mismatch on the profile route (now mounted on the User Service side, but the Gateway still can't reach it correctly) |
 | User Service                  | ✅ Yes                      | ✅ Yes — _if called directly, not through the Gateway_ | The Gateway forwards to the wrong path                         |
-| Admin Service                 | ❌ No — fails to even start | ❌                                                     | Two required config files don't exist in this project          |
-| Search Service                | ❌ No — fails to even start | ❌                                                     | Imports a route file that doesn't exist                        |
+| Admin Service                 | ⚠️ Not verified live (code complete, typechecks) | ❌ | Not proxied through the Gateway correctly yet (method mismatch); no cancel-schedule feature exists either |
+| Search Service                | ⚠️ Not verified live (code complete, typechecks) | ❌ | Not proxied through the Gateway yet; nothing has actually published an event to it live either |
 | Notification Service          | ✅ Yes                      | ✅ Yes, as a background worker (no web routes to test) | —                                                              |
-| Booking / Payment / Inventory | —                           | —                                                      | Don't exist in this repo yet                                   |
+| Inventory Service             | ⚠️ Not verified live (code complete, typechecks) | ❌ | Not proxied through the Gateway yet, and its one real trigger (Admin Service's schedule creation) hasn't been exercised live either |
+| Booking / Payment             | —                           | —                                                      | Don't exist in this repo yet                                   |
 
 None of the above are being fixed as part of this document — this is a
 snapshot of what the code actually does today, so anyone picking this repo
@@ -417,18 +436,16 @@ curl -X POST http://localhost:4001/api/v1/auth/login \
 
 ## 11. Where to Go Deeper
 
-Every service (except User Service, not written yet) has its own detailed
-doc — full architecture diagram, every file explained with its actual
-current code pasted in, every environment variable, and a full list of known
-bugs/dead code found while writing it:
+Every service has its own detailed doc — full architecture diagram, every file
+explained with its actual current code pasted in, every environment variable,
+and a full list of known bugs/dead code found while writing it:
 
 | Doc                                                                          | Covers                                                                         |
 | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------ |
 | [`docs/auth.md`](docs/auth.md)                                               | The complete signup/login/refresh flow, security decisions, every Redis key    |
 | [`api-gateway/docs/README.md`](api-gateway/docs/README.md)                   | Routing, auth middleware, rate limiting, circuit breaker                       |
-| [`admin-service/docs/README.md`](admin-service/docs/README.md)               | Stations, trains, routes, schedules — including why it doesn't compile today   |
-| [`search-service/docs/README.md`](search-service/docs/README.md)             | Elasticsearch indexing + search logic — including why it doesn't compile today |
+| [`user-service/docs/README.md`](user-service/docs/README.md)                 | Auth, profile, the internal user-lookup route                                 |
+| [`admin-service/docs/README.md`](admin-service/docs/README.md)               | Stations, trains, routes, schedules                                           |
+| [`search-service/docs/README.md`](search-service/docs/README.md)             | Elasticsearch indexing + search logic                                         |
 | [`notification-service/docs/README.md`](notification-service/docs/README.md) | The Kafka-driven email worker                                                  |
-
-> **Note:** User Service doesn't have its own `docs/README.md` yet — this
-> root doc's §4 and `docs/auth.md` are currently the best references for it.
+| [`inventory-service/docs/README.md`](inventory-service/docs/README.md)       | Seat inventory, segment locking, the lock-expiry job — including why it's untested live |

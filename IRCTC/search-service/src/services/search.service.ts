@@ -65,9 +65,9 @@ interface TrainDocument {
 /** The full Elasticsearch document stored in the `stations` index. */
 interface StationDocument {
   stationId: string;
-  // Optional: indexStation's own write doesn't currently set this field
-  // (only the per-station reindex inside indexTrainRoute does), so a
-  // station created but never attached to a route may have no name here.
+  // Optional because it's still absent on any station indexed before this
+  // field was added to indexStation's write — not because either write path
+  // omits it going forward (both indexStation and indexTrainRoute set it).
   name?: string;
   code: string;
   city: string;
@@ -126,30 +126,32 @@ interface EsSuggestResult<TSource> {
 /**
  * When admin creates a station, index it for autocomplete.
  * Event shape: { eventType, data: { id, name, code, city, state }, timestamp }
+ *
+ * Errors intentionally propagate rather than being caught here — withDLQ
+ * (wrapping the whole eachMessage handler in kafka/search.service.ts) is what
+ * retries and eventually forwards to the DLQ topic; swallowing the error
+ * locally would make that retry/DLQ path unreachable.
  */
 const indexStation = async (event: StationCreatedEvent): Promise<void> => {
   const station = event.data;
   if (!station) return;
 
-  try {
-    await esClient.index({
-      index: STATION_INDEX,
-      id: station.id,
-      document: {
-        stationId: station.id,
-        code: station.code,
-        city: station.city,
-        suggest: {
-          input: [station.name, station.code, station.city].filter(Boolean),
-          weight: 10,
-        },
+  await esClient.index({
+    index: STATION_INDEX,
+    id: station.id,
+    document: {
+      stationId: station.id,
+      name: station.name,
+      code: station.code,
+      city: station.city,
+      suggest: {
+        input: [station.name, station.code, station.city].filter(Boolean),
+        weight: 10,
       },
-      refresh: true,
-    });
-    logger.info(`Indexed station ${station.name} (${station.code})`);
-  } catch (err) {
-    logger.error(`Failed to index station: ${errorMessage(err)}`);
-  }
+    },
+    refresh: true,
+  });
+  logger.info(`Indexed station ${station.name} (${station.code})`);
 };
 
 /**
@@ -226,6 +228,8 @@ const indexTrainRoute = async (
 
 /**
  * When admin creates a schedule, add it to the train's schedules array.
+ * Errors propagate to withDLQ rather than being caught here — see the note
+ * on indexStation above for why.
  */
 const indexSchedule = async (
   scheduleEvent: ScheduleCreatedEvent,
@@ -234,110 +238,98 @@ const indexSchedule = async (
 
   const totalSeats = seats ? seats.length : 0;
 
-  try {
-    await esClient.update({
-      index: TRAIN_INDEX,
-      id: trainId,
-      script: {
-        source: `
-            if (ctx._source.schedules == null) { ctx._source.schedules = []; }
-            // Remove existing schedule with same id (idempotent)
-            ctx._source.schedules.removeIf(s -> s.scheduleId == params.scheduleId);
-            ctx._source.schedules.add(params.newSchedule);
-          `,
-        params: {
+  await esClient.update({
+    index: TRAIN_INDEX,
+    id: trainId,
+    script: {
+      source: `
+          if (ctx._source.schedules == null) { ctx._source.schedules = []; }
+          // Remove existing schedule with same id (idempotent)
+          ctx._source.schedules.removeIf(s -> s.scheduleId == params.scheduleId);
+          ctx._source.schedules.add(params.newSchedule);
+        `,
+      params: {
+        scheduleId,
+        newSchedule: {
           scheduleId,
-          newSchedule: {
-            scheduleId,
-            departureDate,
-            status,
-            available: totalSeats,
-            locked: 0,
-            booked: 0,
-          },
+          departureDate,
+          status,
+          available: totalSeats,
+          locked: 0,
+          booked: 0,
         },
       },
-      refresh: true,
-    });
-    logger.info(`Indexed schedule ${scheduleId} for train ${trainId}`);
-  } catch (err) {
-    logger.warn(
-      `Could not index schedule for train ${trainId}: ${errorMessage(err)}`,
-    );
-  }
+    },
+    refresh: true,
+  });
+  logger.info(`Indexed schedule ${scheduleId} for train ${trainId}`);
 };
 
 /**
  * When admin cancels a schedule, update its status in ES.
  * Event shape: { eventType, data: { id, trainId, status: 'CANCELLED', ... }, timestamp }
+ * Errors propagate to withDLQ rather than being caught here.
  */
 const cancelSchedule = async (event: ScheduleCancelledEvent): Promise<void> => {
   const schedule = event.data;
   if (!schedule) return;
 
-  try {
-    await esClient.update({
-      index: TRAIN_INDEX,
-      id: schedule.trainId,
-      script: {
-        source: `
-            if (ctx._source.schedules != null) {
-              for (def s : ctx._source.schedules) {
-                if (s.scheduleId == params.scheduleId) {
-                  s.status = 'CANCELLED';
-                }
+  await esClient.update({
+    index: TRAIN_INDEX,
+    id: schedule.trainId,
+    script: {
+      source: `
+          if (ctx._source.schedules != null) {
+            for (def s : ctx._source.schedules) {
+              if (s.scheduleId == params.scheduleId) {
+                s.status = 'CANCELLED';
               }
             }
-          `,
-        params: { scheduleId: schedule.id },
-      },
-      refresh: true,
-    });
-    logger.info(
-      `Cancelled schedule ${schedule.id} for train ${schedule.trainId}`,
-    );
-  } catch (err) {
-    logger.warn(`Could not cancel schedule: ${errorMessage(err)}`);
-  }
+          }
+        `,
+      params: { scheduleId: schedule.id },
+    },
+    refresh: true,
+  });
+  logger.info(
+    `Cancelled schedule ${schedule.id} for train ${schedule.trainId}`,
+  );
 };
 
 /**
  * When inventory changes (seat booked/released), update availability counts.
+ * Errors propagate to withDLQ rather than being caught here.
  */
 const updateSeatAvailability = async (
   event: SeatAvailabilityUpdatedEvent,
 ): Promise<void> => {
   const { scheduleId, trainId, available, locked, booked } = event;
 
-  try {
-    await esClient.update({
-      index: TRAIN_INDEX,
-      id: trainId,
-      script: {
-        source: `
-            if (ctx._source.schedules != null) {
-              for (def s : ctx._source.schedules) {
-                if (s.scheduleId == params.scheduleId) {
-                  s.available = params.available;
-                  s.locked    = params.locked;
-                  s.booked    = params.booked;
-                }
+  await esClient.update({
+    index: TRAIN_INDEX,
+    id: trainId,
+    script: {
+      source: `
+          if (ctx._source.schedules != null) {
+            for (def s : ctx._source.schedules) {
+              if (s.scheduleId == params.scheduleId) {
+                s.available = params.available;
+                s.locked    = params.locked;
+                s.booked    = params.booked;
               }
             }
-          `,
-        params: {
-          scheduleId,
-          available: available || 0,
-          locked: locked || 0,
-          booked: booked || 0,
-        },
+          }
+        `,
+      params: {
+        scheduleId,
+        available: available || 0,
+        locked: locked || 0,
+        booked: booked || 0,
       },
-      refresh: true,
-    });
-    logger.info(`Updated availability for schedule ${scheduleId}`);
-  } catch (err) {
-    logger.warn(`Could not update availability: ${errorMessage(err)}`);
-  }
+    },
+    refresh: true,
+  });
+  logger.info(`Updated availability for schedule ${scheduleId}`);
 };
 
 // ═══════════════════════════════════════════════════

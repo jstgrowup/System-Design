@@ -1,26 +1,49 @@
 import { z } from "zod";
 
-export const zStation = z.object({
-  name: z
-    .string({ error: "Station name is required" })
-    .min(4, "Station name must be at least 4 characters")
-    .max(40, "Station name cannot exceed 40 characters")
-    .trim(),
-  code: z
-    .string({ error: "Station code is required" })
-    .min(2, "Station code must be at least 2 characters")
-    .max(10, "Station code cannot exceed 10 characters")
-    .trim()
-    .toUpperCase(),
-  city: z
-    .string({ error: "City is required" })
-    .min(2, "City must be at least 2 characters")
-    .max(40, "City cannot exceed 40 characters")
-    .trim(),
-  state: z
-    .string()
-    .max(40, "State cannot exceed 40 characters")
-    .trim()
-    .optional(),
+const zSeatIds = z
+  .array(z.string({ error: "Each seatId must be a string" }))
+  .min(1, "seatIds must be a non-empty array");
+
+export const zLockSeats = z.object({
+  scheduleId: z.string({ error: "scheduleId is required" }),
+  seatIds: zSeatIds,
+  userId: z.string({ error: "userId is required" }),
+  ttlSeconds: z.number().positive().optional(),
+  fromSeq: z.number().int().positive().optional(),
+  toSeq: z.number().int().positive().optional(),
 });
-export type StationBodyType = z.infer<typeof zStation>;
+export type LockSeatsBodyType = z.infer<typeof zLockSeats>;
+
+export const zUnlockSeats = z.object({
+  scheduleId: z.string({ error: "scheduleId is required" }),
+  seatIds: zSeatIds,
+  userId: z.string({ error: "userId is required" }),
+  fromSeq: z.number().int().positive().optional(),
+  toSeq: z.number().int().positive().optional(),
+});
+export type UnlockSeatsBodyType = z.infer<typeof zUnlockSeats>;
+
+export const zConfirmSeats = z.object({
+  scheduleId: z.string({ error: "scheduleId is required" }),
+  seatIds: zSeatIds,
+  bookingId: z.string({ error: "bookingId is required" }),
+  userId: z.string({ error: "userId is required" }),
+  fromSeq: z.number().int().positive().optional(),
+  toSeq: z.number().int().positive().optional(),
+});
+export type ConfirmSeatsBodyType = z.infer<typeof zConfirmSeats>;
+
+export const zCancelBooking = z.object({
+  scheduleId: z.string({ error: "scheduleId is required" }),
+  bookingId: z.string({ error: "bookingId is required" }),
+  userId: z.string({ error: "userId is required" }),
+});
+export type CancelBookingBodyType = z.infer<typeof zCancelBooking>;
+
+export const zSeatFilters = z.object({
+  status: z.enum(["AVAILABLE", "LOCKED", "BOOKED", "CANCELLED"]).optional(),
+  seatType: z.string().optional(),
+  fromSeq: z.coerce.number().int().positive().optional(),
+  toSeq: z.coerce.number().int().positive().optional(),
+});
+export type SeatFiltersQueryType = z.infer<typeof zSeatFilters>;

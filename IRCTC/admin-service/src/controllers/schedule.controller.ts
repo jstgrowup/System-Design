@@ -6,8 +6,7 @@ import asyncHandler from "../utils/asyncHandler";
 import { scheduleService } from "../services/schedule.service";
 
 /**
- * POST /schedule (defined in schedule.route.ts — see that file for why
- * this endpoint can't actually be reached today)
+ * POST /schedules/schedule
  *
  * Creates a schedule (a specific departureDate run) for an existing train
  * that already has a route defined. Expects a JSON body matching
@@ -21,9 +20,7 @@ import { scheduleService } from "../services/schedule.service";
  *     creates the schedule row, and publishes a denormalized
  *     SCHEDULE_CREATED Kafka event (train + seats + route inlined) for
  *     inventory-service and search-service.
- *  3. Respond 200. The success message below ("Train created
- *     successfully") is a copy-paste leftover from train.controller.ts —
- *     it describes the wrong resource.
+ *  3. Respond 200.
  */
 const createSchedule = asyncHandler(
   async (req: Request, res: Response, next: NextFunction) => {
@@ -39,7 +36,7 @@ const createSchedule = asyncHandler(
     await scheduleService.createSchedule({ trainId, departureDate });
     return res
       .status(200)
-      .json({ success: true, message: "Train created successfully" });
+      .json({ success: true, message: "Schedule created successfully" });
   },
 );
 

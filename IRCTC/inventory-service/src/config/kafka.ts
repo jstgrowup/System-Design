@@ -63,4 +63,33 @@ const disconnectProducer = async (): Promise<void> => {
   }
 };
 
-export { kafka, producer, connectProducer, disconnectProducer };
+/**
+ * Kafka consumer instance for SCHEDULE_CREATED / SCHEDULE_CANCELLED.
+ * A dedicated group ID isolates this service's partition assignment/offsets
+ * from every other consumer group in the cluster.
+ */
+const consumer = kafka.consumer({
+  groupId: "inventory-service-group",
+  sessionTimeout: 30000,
+  heartbeatInterval: 3000,
+});
+
+const disconnectConsumer = async (): Promise<void> => {
+  await consumer.disconnect();
+  logger.info("Kafka consumer disconnected");
+};
+
+const disconnectAll = async (): Promise<void> => {
+  await disconnectProducer();
+  await disconnectConsumer();
+};
+
+export {
+  kafka,
+  producer,
+  consumer,
+  connectProducer,
+  disconnectProducer,
+  disconnectConsumer,
+  disconnectAll,
+};

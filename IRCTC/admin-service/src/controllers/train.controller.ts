@@ -102,19 +102,11 @@ const createRoute = asyncHandler(
   },
 );
 /**
- * POST /trains/route/:id
+ * GET /trains/train/:trainId
  *
  * Fetches a single train by id, including its seats (ordered by
  * seatNumber) and its route (ordered by sequenceNumber, each stop
  * including the full station record).
- *
- * Two bugs make this endpoint unusable as currently routed
- * (see `train.routes.ts`):
- *  - it's mounted as `POST`, not `GET`, despite being a pure read;
- *  - the route param is named `:id`, but this handler reads
- *    `req.params.trainId` — always `undefined` — so every request to
- *    this path 400s with "Train Id is missing" before `trainService
- *    .getTrainById` is ever called.
  */
 const getTrainById = asyncHandler(
   async (req: Request, res: Response, next: NextFunction) => {

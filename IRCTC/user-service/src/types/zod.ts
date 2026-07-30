@@ -35,3 +35,16 @@ export const zLogin = z.object({
     .regex(/[0-9]/, "Password must contain at least one number"),
 });
 export type LoginBodyType = z.infer<typeof zLogin>;
+
+// Email/password intentionally excluded — those go through their own
+// verification-gated flows, not a plain profile update.
+export const zUpdateProfile = z.object({
+  firstName: z
+    .string()
+    .min(4, "First name must be at least 4 characters")
+    .max(40, "First name cannot exceed 40 characters")
+    .trim()
+    .optional(),
+  lastName: z.string().max(40).trim().optional(),
+});
+export type UpdateProfileBodyType = z.infer<typeof zUpdateProfile>;

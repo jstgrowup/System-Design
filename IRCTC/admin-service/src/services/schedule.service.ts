@@ -21,11 +21,6 @@ import adminProducer from "../kafka/producer/admin.producer";
  *     inventory-service and search-service don't need to call back into
  *     admin-service just to react to a new schedule.
  *  6. Publish it as a SCHEDULE_CREATED Kafka event.
- *
- * Note: as of this writing, nothing calls this function via HTTP —
- * `schedule.route.ts` defines the route but `server.ts` never mounts it
- * (see that file's comment), so this only runs if invoked directly (e.g.
- * from a test).
  */
 const createSchedule = async ({ trainId, departureDate }: ScheduleBodyType) => {
   // Train number is the unique identifier — reject duplicates before hitting the DB constraint

@@ -84,7 +84,22 @@ const verifyOtp = async ({
     },
   });
 
-  return user;
+  // Fire-and-forget: a failure here shouldn't turn a successful account
+  // creation into an error response, matching the pattern other non-critical
+  // Kafka publishes in this codebase follow (e.g. admin-service's createTrain).
+  try {
+    await notificationProducer.sendWelcomeEmail(user.email, user.firstName);
+  } catch (err) {
+    logger.error("Failed to publish welcome email event", {
+      email: user.email,
+      error: (err as Error).message,
+    });
+  }
+
+  // Every other read path in this service strips the bcrypt hash before
+  // returning a user row — do the same here instead of leaking it to the client.
+  const { password: _password, ...safeUser } = user;
+  return safeUser;
 };
 
 /**

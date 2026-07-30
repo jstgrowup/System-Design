@@ -42,14 +42,16 @@ belonging to those (`inventory.seat-availability-updated`, `booking.*`,
 | Service | Port | Purpose | Builds? | Runtime status |
 |---|---|---|---|---|
 | **api-gateway** | 4000 | Single entry point; JWT auth, rate limiting, circuit breakers, reverse-proxies to downstream services | ✅ Yes | Starts fine, but **every one of its 4 proxied routes is broken** (see §6) |
-| **user-service** | 4001 | Signup (email+OTP), login, refresh-token rotation, user profile | ✅ Yes, but **fails `tsc --noEmit`** (see §6) | Starts and serves auth routes correctly; profile routes exist in code but are never mounted |
-| **search-service** | 4002 | Elasticsearch-backed train/station search, kept in sync via Kafka | ❌ **No** — two independent compile errors in `index.ts` | Cannot start at all as checked in |
-| **admin-service** | 4001 (`.env`) / 4003 (assumed by gateway) | Staff-facing station/train/route/schedule management, publishes domain events | ❌ **No** — `src/index.ts` imports `./config` and `./config/db`, neither of which exists anywhere in the project | Cannot start at all — nothing downstream of it can be exercised through a real HTTP call |
+| **user-service** | 4001 | Signup (email+OTP), login, refresh-token rotation, user profile | ✅ Yes, `tsc --noEmit` passes clean | Auth routes still work as before; profile routes are now mounted (`updateProfile`/`deleteProfile` implemented, previously empty stubs that hung every request), `verifyOtp` no longer leaks the password hash, the welcome email is now sent, and a new internal-only user-lookup route exists for other services — see §5 and §6 |
+| **search-service** | 4002 | Elasticsearch-backed train/station search, kept in sync via Kafka | ✅ Yes, `tsc --noEmit` passes clean | Code is complete and typechecks; **not verified live** (no reachable Elasticsearch/Kafka in this sandbox). The wrong-import build failure documented here previously was already stale by the time this was checked — the actual blockers were a bad controller import and three dead files referencing config fields that don't exist — see §5 and §6 |
+| **admin-service** | 4003 | Staff-facing station/train/route/schedule management, publishes domain events | ✅ Yes, `tsc --noEmit` passes clean | Code is complete and typechecks; **not verified live** (no reachable Postgres/Kafka in this sandbox). All 4 routes now mount, `createRoute`'s inverted check and `createStation`'s missing `await` are fixed, `ROUTE_CREATED` now publishes, and every route is behind `getUserContext` — see §5 and §6 |
 | **notification-service** | 4004 | Pure Kafka consumer — renders and sends transactional emails via Resend | ✅ Yes | Starts and runs correctly; only 2 of 5 email types it can send are ever actually triggered |
+| **inventory-service** | 4007 | Per-schedule seat inventory: tracks available/locked/booked counts and individual seat state, supports segment (partial-journey) locking, kept in sync via Kafka from admin-service's schedule events | ✅ Yes, `tsc --noEmit` passes clean | Code is complete and typechecks; **not verified live** — this sandbox has no reachable Postgres/Kafka, so `npm run dev` and an actual HTTP/Kafka round-trip haven't been exercised. Blocked from ever actually receiving events in practice because `admin.schedule-created` never fires (see Tier 2 below) and no gateway route reaches it (see api-gateway row) |
 
-`admin-service`'s and `admin/user-service`'s `.env` PORT values collide (see §7,
-"admin-service's `.env` is user-service's `.env`") — this is one of several reasons
-admin-service's actual intended port is unclear even setting the build failure aside.
+`admin-service` previously had no `.env.example` of its own and, per §7, once had
+a real (gitignored, uncommitted) `.env` that was byte-for-byte user-service's —
+both now have proper, distinct `.env.example` files with the ports the Gateway
+already assumed (`4003` for admin, `4001` for user).
 
 ---
 
@@ -64,16 +66,16 @@ flowchart TB
     end
 
     subgraph Services["Services"]
-        US["User Service :4001<br/>signup/login/refresh, Postgres+Redis"]
-        AS["Admin Service :4001/4003<br/>❌ does not build<br/>stations/trains/routes/schedules, Postgres"]
-        SS["Search Service :4002<br/>❌ does not compile<br/>Elasticsearch-backed search"]
+        US["User Service :4001<br/>✅ builds + typechecks<br/>signup/login/refresh/profile, Postgres+Redis"]
+        AS["Admin Service :4003<br/>✅ builds + typechecks, not verified live<br/>stations/trains/routes/schedules, Postgres"]
+        SS["Search Service :4002<br/>✅ builds + typechecks, not verified live<br/>Elasticsearch-backed search"]
         NS["Notification Service :4004<br/>pure Kafka consumer, sends email via Resend"]
+        IS["Inventory Service :4007<br/>✅ builds + typechecks, not verified live<br/>seat inventory + segment locks, Postgres"]
     end
 
     subgraph NotBuilt["Referenced but not built in this repo"]
         BS["booking-service"]
         PS["payment-service"]
-        IS["inventory-service"]
     end
 
     subgraph Infra["Infrastructure (docker-compose)"]
@@ -85,18 +87,20 @@ flowchart TB
 
     Client --> GW
     GW -- "proxies (both broken today)" --> US
-    GW -- "proxies (both broken today)" --> AS
+    GW -- "proxies (broken: method mismatch)" --> AS
     GW -.->|"configured, no route wired up"| SS
     GW -.->|"configured, no route wired up"| NS
+    GW -.->|"configured, no route wired up"| IS
     GW -.->|"configured, no route wired up"| BS
     GW -.->|"configured, no route wired up"| PS
-    GW -.->|"configured, no route wired up"| IS
+    IS --> PG
+    KF -.->|"would populate schedule/seat rows,<br/>if anyone ever calls POST /schedules/schedule"| IS
 
     US --> PG
     US --> RD
-    US -- "notification.otp-email<br/>notification.welcome-email (never called)" --> KF
+    US -- "notification.otp-email<br/>notification.welcome-email" --> KF
     AS --> PG
-    AS -- "admin.station-created ✅ fires<br/>admin.train-created ✅ fires<br/>admin.route-created ❌ commented out<br/>admin.schedule-created ❌ route unmounted<br/>admin.schedule-cancelled ❌ no caller" --> KF
+    AS -- "admin.station-created ✅ fires<br/>admin.train-created ✅ fires<br/>admin.route-created ✅ fires<br/>admin.schedule-created ✅ fires (route now mounted)<br/>admin.schedule-cancelled ❌ no caller, feature not built" --> KF
     KF --> SS
     SS --> ES
     KF --> NS
@@ -155,8 +159,8 @@ This simplicity is exactly why routes break — see §6.
 ### user-service
 Owns identity: `User` table in Postgres (id, firstName, lastName, email, optional
 password, emailVerified, timestamps — no roles/sessions table, no OAuth fields even
-though `GOOGLE_CLIENT_ID`/`SECRET` are read into config and never used). Sessions
-live entirely in Redis, not Postgres:
+though `GOOGLE_CLIENT_ID`/`SECRET` are read into config and never used — deliberately
+out of scope for this pass, see below). Sessions live entirely in Redis, not Postgres:
 
 - `otp:session:<id>` — pending-signup metadata + HMAC'd OTP, TTL-bound
 - `otp:rate:<email>` / `otp:attempt:<email>` — hourly request cap / verify-attempt cap
@@ -170,22 +174,68 @@ as httpOnly/secure/sameSite=strict cookies, never in the JSON body. Refresh rota
 detects token reuse (a mismatched JTI triggers session revocation) — a real, working
 security feature, not just a checkbox.
 
-The service also drags in unused Mongoose/MongoDB wiring (`config/db.ts`, imported
-in `index.ts`, never actually needed — the real datastore is Postgres) and a set of
-config fields that are read but never consumed anywhere (`SENDGRID_API_KEY`,
-`GOOGLE_CLIENT_ID/SECRET`, `INTERNAL_SERVICE_KEY`, `RESEND_API_KEY`, `MAIL_SEND`,
-`NODE_ENV`) — see api-contract.md's Known Issues for the full list and why each is
-dead.
+**Fixed this pass**: `user.route.ts` (profile routes) is now mounted at `/user` in
+`server.ts` — it was fully written but never wired up before. `updateProfile` and
+`deleteProfile` were empty `// TODO` stubs that hung every request (`asyncHandler`
+never sends a response if the wrapped function doesn't); both are implemented now
+(`updateProfile` only allows changing `firstName`/`lastName` — email and password
+are deliberately excluded, those need their own verification-gated flows).
+`verifyOtp` no longer returns the bcrypt password hash to the client — the service
+layer now strips it, matching every other read path. `sendWelcomeEmail` is now
+actually called from `verifyOtp` (fire-and-forget, log-only on failure) — the
+producer method and the notification-service consumer were both already correct,
+nothing had ever called the producer. `getUserProfile`'s cache-miss bug (returning
+the unscrubbed row instead of the scrubbed copy it just cached) is fixed. A new
+`GET /user/internal/:userId` route exists behind a shared-secret `internalAuth`
+middleware (mirroring the pattern already built for inventory-service) — needed by
+booking-service, built later, to resolve a user's profile without a JWT. A missing
+`Express.Request.user` type augmentation (why `tsc --noEmit` used to fail) is added.
+The unused Mongoose/MongoDB wiring (`config/db.ts`, imported in `index.ts` but never
+called — the real datastore is Postgres) is deleted outright, along with a
+`types/index.ts` carrying the same unrelated RAG/`KnowledgeDoc` dead code found in
+admin-service. `INTERNAL_SERVICE_KEY` is no longer a dead config field — the new
+internal route actually reads it now.
+
+**Still dead, out of scope for this pass**: `SENDGRID_API_KEY`, `GOOGLE_CLIENT_ID/SECRET`,
+`RESEND_API_KEY`, `MAIL_SEND`, `NODE_ENV` — read into config, never consumed anywhere
+in this service.
+
+**Not verified live** — fixed and typechecked (`tsc --noEmit` passes clean) in a
+sandbox with no reachable Postgres/Redis/Kafka.
 
 ### admin-service
 Owns the staff-facing catalog: Station, Train (+ Seats), Route (+ RouteStations,
 one route per train, enforced by a unique constraint), Schedule (one per
-`(trainId, departureDate)`). All four resources are modeled cleanly in Prisma; the
-problem is entirely in the application layer sitting on top, and in one missing
-directory of files (see §6).
+`(trainId, departureDate)`). All four resources are modeled cleanly in Prisma.
+
+`config/index.ts` was present but **empty**, and `index.ts`/every config
+submodule imported a `config/db.ts` that never existed anywhere in the project —
+this is what actually blocked the build (the root README's "two missing files"
+framing was slightly imprecise: one file was missing, the other existed but
+empty). Fixed by populating `config/index.ts` (same shape as inventory-service's:
+`SERVICE_NAME`, `PORT` default 4003, `DATABASE_URL`, `ALLOWED_ORIGINS`,
+`KAFKA_BROKER`, `KAFKA_CLIENT_ID`, `INTERNAL_SERVICE_KEY`) and dropping the dead
+`config/db.ts` import from `index.ts` — Prisma's own `config/prisma.ts` already
+owns the DB connection, no separate connect call was ever needed. Also fixed:
+`createStation` now `await`s the service call and returns a correct
+`"Station created successfully"` message (was `"OTP sent successfully"`);
+`createRoute`'s existence check was inverted (`if (!existingRoute) throw
+"already exists"` — fixed to `if (existingRoute) throw`, also fixing the
+"existis" typo); `getTrainById` is now mounted as `GET /trains/train/:trainId`
+with the controller's own `:trainId` param name (was `POST /trains/route/:id`);
+`schedule.route.ts` is now mounted at `/schedules` in `server.ts`; the
+`ROUTE_CREATED` publish (previously commented out) now fires after a route is
+created; every route across all three routers is now behind `getUserContext`
+(previously zero auth was wired up anywhere in this service); the dead
+`types/index.ts` (RAG/`KnowledgeDoc` types unrelated to this service's domain,
+imported `mongoose` for no reason) was deleted. `admin.schedule-cancelled` still
+has no caller — no cancel-schedule feature (route/controller/service) exists,
+and building one wasn't in scope for this pass.
 
 This service is a pure Kafka **producer** — it has no consumer of its own anywhere
-in `src/kafka/`.
+in `src/kafka/`. **Not verified live** — fixed and typechecked
+(`tsc --noEmit` passes clean) in a sandbox with no reachable Postgres/Kafka, so
+no actual HTTP request or Kafka publish has been exercised yet.
 
 ### search-service
 The only service backed by Elasticsearch instead of Postgres. Two indices:
@@ -193,14 +243,35 @@ The only service backed by Elasticsearch instead of Postgres. Two indices:
 document with a nested `route` array and a `schedules` array — routes and schedules
 are not separate ES indices even though `ROUTE_INDEX`/`SCHEDULE_INDEX` constants
 exist for them). It's a pure Kafka **consumer** with a small HTTP surface bolted on
-top (recently added — see api-contract.md and §6).
+top.
 
-The service also still carries a large chunk of unused api-gateway-style scaffolding
-(JWT auth middleware, Redis-backed rate limiting, a Redis client) that predates the
-Elasticsearch rewrite and doesn't compile against this service's trimmed-down
-`Config` type — none of it is imported by `index.ts`, so it's inert rather than
-actively broken, but it's dead weight worth knowing about if you're grepping this
-service for "how does auth work here" (answer: it doesn't, that code is a leftover).
+The compile failure previously documented here (a singular/plural import mismatch,
+a default/named export mismatch on `errorMiddleware`) was already stale — both had
+apparently been fixed independently before this pass started. What actually blocked
+the build: `search.controller.ts` imported `searchService` from a nonexistent
+`../services/inventory.service` (should be `../services/search.service` — another
+instance of the copy-paste pattern, since that file's whole top doc-comment was
+also admin-service's schedule-controller comment, now removed), and three files
+(`config/redis.ts`, `middlewares/auth.middleware.ts`,
+`middlewares/rate-limiting.middleware.ts`) — the unused api-gateway-style
+scaffolding previously described as merely "inert" — actually reference config
+fields (`REDIS_URL`, `JWT_ACCESS_SECRET`, `RATE_LIMIT_MAX_REQUESTS`,
+`RATE_LIMIT_WINDOW_MS`) that don't exist on this service's trimmed-down `Config`
+type. Since nothing outside that three-file cluster imported any of them, and
+`tsc` type-checks every file matched by `include` regardless of whether it's
+actually imported, this dead code blocked the whole service from compiling even
+though it was functionally inert. All three files were deleted (confirmed unused
+first). Also fixed: `searchTrains` now returns its real search results instead of
+a hardcoded message; `debugStations`/`debugTrains` now call `getAllStations`/
+`getAllTrains` instead of both calling `autocompleteStation`; `indexStation` now
+sets the `name` field on the document it writes; `indexStation`/`indexSchedule`/
+`cancelSchedule`/`updateSeatAvailability` no longer swallow their own
+Elasticsearch errors internally, so `withDLQ`'s retry-then-DLQ path can actually
+trigger; a `notFound` 404 handler (previously written but never mounted) is now
+registered before the error middleware.
+
+**Not verified live** — fixed and typechecked (`tsc --noEmit` passes clean) in a
+sandbox with no reachable Elasticsearch or Kafka broker.
 
 ### notification-service
 The simplest service in the repo: no HTTP routes at all (not even its own health
@@ -212,6 +283,40 @@ delivery goes through Resend (not SendGrid, despite `SENDGRID_API_KEY` being rea
 into config) with a 3-attempt retry inside `email-service.ts`, separate from the
 Kafka-level 3-retry-then-DLQ mechanism in `shared/utils/dlqHanlder.ts`.
 
+### inventory-service
+Owns per-schedule seat state: `ScheduleInventory` (one row per admin-service
+schedule, aggregate available/locked/booked counters recomputed from actual seat
+rows rather than trusted as a running total), `SeatInventory` (one row per physical
+seat per schedule), `SeatSegmentLock` (partial-journey locks — two segments overlap
+when `a.fromSeq < b.toSeq AND b.fromSeq < a.toSeq`), `RouteStop` (ordered station
+list per schedule, for resolving a station to its sequence number), and
+`IdempotencyRecord` (guards the Kafka consumer against reprocessing).
+
+It's a pure Kafka **consumer** (`admin.schedule-created` → `initializeInventory`,
+`admin.schedule-cancelled` → `cancelScheduleInventory`) with a small HTTP surface:
+`GET /schedules/:id/availability` (public), `GET /schedules/:id/seats` (end user via
+gateway, or booking-service via an internal shared-secret header), and
+`POST /seats/{lock,unlock,confirm,cancel-booking}` (internal-only, for
+booking-service's saga). A background job (`utils/lockExpiry.ts`) uses a Postgres
+advisory lock for leader election so only one running instance releases expired
+seat/segment locks on an interval, then republishes `inventory.seat-availability-updated`.
+
+Seat mutations use row-level `FOR UPDATE NOWAIT` locks plus a `retryTransaction`
+wrapper that retries on Postgres serialization/deadlock errors — deliberate
+pessimistic concurrency control, no Redis involved (unlike booking-service's
+distributed locks).
+
+Two things worth flagging about how this service reached its current state: the
+Prisma schema, the Kafka consumer's event types, and the service layer were found
+mid-session having reverted to an earlier stub/scaffold state (matching
+admin-service's schema and a copy-pasted admin-style controller) despite a more
+complete implementation having existed moments earlier in the same working
+session — the version described here is the restored/completed one, verified via
+`tsc --noEmit` and `prisma generate` only. **This has not been run against a live
+Postgres/Kafka** — no broker or database was reachable in the environment this was
+built in, so the HTTP routes and Kafka consumer are untested beyond static
+type-checking.
+
 ---
 
 ## 6. Why nothing currently works end-to-end
@@ -221,102 +326,110 @@ from a full audit of every service. See `api-contract.md` for the file:line-leve
 detail behind each line.
 
 **Tier 1 — a service can't even start:**
-- **admin-service never builds.** `src/index.ts` imports `./config` and
-  `./config/db`; every other file under `src/` that needs config imports it too
-  (logger, prisma client, kafka client, cors middleware) — neither file exists
-  anywhere in the project. Nothing that depends on admin-service being reachable
-  (station/train/route/schedule creation, and by extension most of search-service's
-  and the gateway's admin routes) can be exercised through a real request.
-- **search-service never compiles.** `src/index.ts` imports `./routes/search.route`
-  (singular) — the actual file, added later, is `routes/search.routes.ts` (plural),
-  so the import still doesn't resolve — plus it default-imports `errorHandler` from
-  `error.middleware.ts`, which only has a named export.
+- ~~admin-service never builds~~ **Fixed.** `config/index.ts` was present but
+  empty and `index.ts` imported a `config/db.ts` that never existed anywhere in
+  the project — populated the former, dropped the dead import to the latter
+  (Prisma's own `config/prisma.ts` already owns the DB connection). See §5.
+- ~~search-service never compiles~~ **Fixed.** The originally-documented cause
+  (a singular/plural import mismatch, a default/named export mismatch) was
+  already stale by the time this was checked — the real blockers were a
+  controller importing from a nonexistent path and three dead scaffold files
+  referencing config fields that don't exist. See §5.
 
 **Tier 2 — a service builds and starts, but its main entry points are broken:**
 - **Every gateway-proxied route is broken**, for three different reasons: (a)
   `POST /api/users/auth/login` forwards to `/auth/login`, but user-service actually
   mounts login at `/api/v1/auth/login` — the gateway's "strip one segment" rule
-  can't reproduce that prefix; (b) `GET /api/users/user/profile` forwards to a route
-  that doesn't exist on user-service at all (`user.route.ts` is never mounted in
-  `server.ts`), and even if it were, that file only defines `POST`/`PUT`/`DELETE
-  /profile`, no `GET`; (c) the two admin routes
+  can't reproduce that prefix; (b) `GET /api/users/user/profile` forwards to
+  `/user/profile`, which now exists on user-service (`user.route.ts` is mounted at
+  `/user` as of this pass — see §5), but that file only defines `POST`/`PUT`/`DELETE
+  /profile`, no `GET`, so the method mismatch remains; (c) the two admin routes
   (`GET /api/admins/stations/station`, `GET /api/admins/trains/train`) are
   registered as `GET` at the gateway but admin-service only defines `POST` for
-  those paths — a method mismatch, independent of admin-service's build failure.
-- **user-service doesn't typecheck.** `middlewares/user-context.middleware.ts`
-  accesses `req.user`, but no `Express.Request` augmentation exists anywhere in the
-  service to give `Request` a `user` field — `npx tsc --noEmit` fails.
+  those paths — a method mismatch, still unfixed on the gateway side (admin-service
+  itself now builds and runs, see §5, but the gateway can't reach it correctly yet).
+  All three are gateway-side fixes, not yet done.
+- ~~user-service didn't typecheck~~ **Fixed** — `middlewares/user-context.middleware.ts`
+  accesses `req.user`, but no `Express.Request` augmentation existed anywhere in the
+  service to give `Request` a `user` field; added `types/express.d.ts`, matching the
+  same fix already applied to admin-service and inventory-service.
 
 **Tier 3 — real logic bugs that would misbehave once the above is fixed:**
-- `admin-service`'s `createRoute` has an inverted existence check
-  (`train.service.ts`) — a train can never get its *first* route created; the error
-  path meant for "route already exists" fires exactly when no route exists yet.
-- `station.controller.createStation` doesn't `await` the service call — the 200
-  response fires before the DB write settles, and any `ConflictError` becomes an
-  unhandled promise rejection instead of a 409.
-- `admin-service`'s `getTrainById` is unreachable by design: mounted `POST
-  /trains/route/:id` (route param named `:id`), but the controller reads
-  `req.params.trainId` — always `undefined`, always 400s.
-- `user-service`'s `verifyOtp` returns the newly-created user **including the bcrypt
-  password hash** in the response body — every other read path in this service
-  strips `password` first, this one doesn't.
-- `user-service`'s `getUserProfile` strips the password before caching to Redis, but
-  on a cache miss it accidentally **returns the unscrubbed row it just fetched**,
-  not the scrubbed copy it just cached — so a cold cache leaks the hash, a warm one
-  doesn't.
-- `user-service`'s `updateProfile`/`deleteProfile` are empty `// TODO` stubs that
-  never send a response — calling either (once `user.route.ts` is mounted) hangs the
-  request until the client times out.
-- `search-service`'s `searchController.searchTrains` computes real search results
-  and then discards them, responding with a hardcoded, copy-pasted
-  `"Train created successfully"` message instead.
-- `search-service`'s `debugStations` and `debugTrains` handlers are both wired to
-  call `autocompleteStation` — a copy-paste bug; they should call `getAllStations`/
-  `getAllTrains` respectively, which exist for exactly this purpose.
+- ~~`admin-service`'s `createRoute` had an inverted existence check~~ **Fixed** —
+  was `if (!existingRoute) throw "already exists"` (blocking every train's *first*
+  route), now `if (existingRoute) throw ConflictError(...)`.
+- ~~`station.controller.createStation` didn't `await` the service call~~ **Fixed**
+  — now awaited, and returns the correct `"Station created successfully"` message.
+- ~~`admin-service`'s `getTrainById` was unreachable~~ **Fixed** — now mounted as
+  `GET /trains/train/:trainId`, matching the controller's own param name.
+- ~~`user-service`'s `verifyOtp` returned the newly-created user including the
+  bcrypt password hash~~ **Fixed** — the service layer now strips `password`
+  before returning, matching every other read path.
+- ~~`user-service`'s `getUserProfile` returned the unscrubbed row on a cache
+  miss~~ **Fixed** — now returns the same scrubbed copy it just cached instead
+  of the raw row it just fetched.
+- ~~`user-service`'s `updateProfile`/`deleteProfile` were empty `// TODO`
+  stubs~~ **Fixed** — both implemented (`updateProfile` only allows
+  `firstName`/`lastName`; `deleteProfile` deletes the row and clears the Redis
+  cache entry), and `user.route.ts` is now mounted so they're reachable.
+- ~~`search-service`'s `searchController.searchTrains` discarded its real search
+  results~~ **Fixed** — now returns the actual result set instead of a
+  hardcoded, copy-pasted `"Train created successfully"` message.
+- ~~`search-service`'s `debugStations` and `debugTrains` both called
+  `autocompleteStation`~~ **Fixed** — now call `getAllStations`/`getAllTrains`
+  respectively, which exist for exactly this purpose.
 
 **Tier 4 — Kafka plumbing gaps (nothing crashes, data just silently doesn't flow):**
-- `admin.route-created` never fires — the publish call in `createRoute` is
-  commented out. This means search-service's `trains` index can never be
-  populated, independent of anything in search-service itself.
-- `admin.schedule-created` never fires in practice — the publish call is correct,
-  but its only trigger (`POST /schedule`) is never mounted in admin-service's
-  `server.ts`.
+- ~~`admin.route-created` never fired~~ **Fixed** — the publish call in
+  `createRoute` was commented out (search-service's `trains` index could never be
+  populated); now fires after a route is created (failure caught+logged, matching
+  `createTrain`'s pattern, not re-thrown).
+- ~~`admin.schedule-created` never fired in practice~~ **Fixed** — the publish call
+  was always correct, but its only trigger (`POST /schedules/schedule`) was never
+  mounted in admin-service's `server.ts`; it's mounted now, so calling that route
+  should let inventory-service's consumer receive a real event and initialize a
+  schedule's seat rows — unverified live, but no longer blocked at the admin-service
+  end.
 - `admin.schedule-cancelled` has no caller anywhere — the producer method exists,
   nothing invokes it, and there's no cancel-schedule route/controller/service at all.
-- `notification.welcome-email` is fully wired on both ends (producer method exists
-  in user-service, consumer handles it correctly in notification-service) but
-  **nothing ever calls the producer method** — the natural call site
-  (`verifyOtp`, right after account creation) doesn't call it.
+- ~~`notification.welcome-email` was fully wired on both ends but never
+  fired~~ **Fixed** — `verifyOtp` now calls `sendWelcomeEmail` right after
+  account creation (fire-and-forget, log-only on failure).
 - `booking.confirmed`/`booking.failed`/`booking.cancelled` can never fire — no
   `booking-service` exists in this repo to publish them. Even if one existed, the
   typed payload shapes notification-service expects have no `email` field, so the
   consumer would silently warn-and-skip rather than send anything.
-- search-service's own DLQ safety net doesn't work: every index-operation function
-  catches its own Elasticsearch errors and logs them, so nothing ever propagates
-  out to `withDLQ` — an Elasticsearch outage silently drops writes instead of
-  landing on `dlq.search-service`.
+- ~~search-service's own DLQ safety net didn't work~~ **Fixed** —
+  `indexStation`/`indexSchedule`/`cancelSchedule`/`updateSeatAvailability` each
+  caught their own Elasticsearch errors and logged them, so nothing ever
+  propagated out to `withDLQ`; all four now let errors propagate, so the
+  existing retry-then-DLQ mechanism can actually trigger on an Elasticsearch
+  outage instead of silently dropping the write. (`indexTrainRoute` already
+  didn't swallow its own errors, so it needed no change.)
 
 ---
 
 ## 7. Cross-cutting patterns worth knowing before touching this codebase
 
-- **A copy-paste-comment pattern shows up in at least three places**, always the
+- **A copy-paste-comment pattern showed up in at least four places**, always the
   same shape: a new controller/route file is built by copying an unrelated existing
-  one and adapting the logic, but not the comments above it. Confirmed instances:
+  one and adapting the logic, but not the comments above it. Confirmed instances
+  (all cleaned up as part of fixing each service — see §5):
   `search-service/src/controllers/search.controller.ts` and
-  `routes/search.routes.ts` (comments describe admin-service's schedule-creation
-  feature, `POST /schedule`, `station.route.ts`/`train.routes.ts` mounting — none of
-  which is true of search-service), and `user-service/src/services/user.service.ts`'s
-  `getUserProfile` (docstring describes OTP-based registration, copied from
-  `auth.service.ts`'s `sendOtp`). If you see a comment that doesn't match the code
+  `routes/search.routes.ts` had comments describing admin-service's
+  schedule-creation feature, `POST /schedule`, `station.route.ts`/`train.routes.ts`
+  mounting; `user-service/src/services/user.service.ts`'s `getUserProfile` had a
+  docstring describing OTP-based registration, copied from `auth.service.ts`'s
+  `sendOtp`. If you see a comment that doesn't match the code
   under it, check whether it was copied from somewhere else in the repo before
   assuming it's just stale.
-- **`admin-service/.env` is user-service's `.env`.** Byte-for-byte, both files share
-  the same `PORT=4001`, the same `KAFKA_CLIENT_ID=irctc-service`, the same
-  `ALLOWED_ORIGINS`, and the same OTP/token/mail settings — values that only make
-  sense for user-service (OTP config, token expiry) have no reason to exist in
-  admin-service's env at all. If admin-service's build is ever fixed, starting it
-  with this `.env` as-is would try to bind port 4001, colliding with user-service.
+- **`admin-service/.env` used to be user-service's `.env`, byte-for-byte** (same
+  `PORT=4001`, same `KAFKA_CLIENT_ID=irctc-service`, same OTP/token/mail settings
+  that only make sense for user-service) — this would have collided with
+  user-service on port 4001 the moment admin-service's build was fixed. Neither
+  service actually has a real `.env` checked in (both are gitignored), so this was
+  never externally visible; a fresh `admin-service/.env.example` with its own
+  `PORT=4003` and admin-appropriate values now exists to prevent reintroducing it.
 - **The `docs/auth.md` file** that used to document user-service's auth flow in
   depth was intentionally removed as part of setting up this `docs/` folder — this
   file and `api-contract.md` are now the source of truth for that flow instead.
@@ -342,16 +455,31 @@ detail behind each line.
   this trust boundary has never been exercised end-to-end in practice — worth
   re-checking once the routing bugs are fixed, to confirm nothing downstream can be
   reached by forging that header directly against a service's own port.
+- **`dotenv.config()` runs too late in every service's `index.ts` that follows this
+  pattern** (confirmed in user-service and inventory-service; worth checking the
+  rest): the file's own top-level imports (`./server`, which transitively imports
+  `./config`) execute before `dotenv.config()` is ever called on the line below
+  them, so `config/index.ts`'s `process.env.*` reads see an environment that
+  hasn't had `.env` loaded into it yet. Every value silently falls back to its
+  hardcoded default (`PORT`, `DATABASE_URL`, `KAFKA_BROKER`, etc.) unless those
+  variables happen to already be set in the real OS environment. Fixed in
+  inventory-service by moving `dotenv.config()` to the first line of `index.ts`,
+  before any other import.
+- **A service's own `shared/`-style dependency can be uninstalled even when the
+  service itself is** — `shared/` is its own npm package (own `package.json` +
+  lockfile) separate from every service's `node_modules`, and its `kafkajs`
+  dependency needs `npm ci` run inside `shared/` itself, not just inside whichever
+  service imports `shared/utils/dlqHanlder.ts`. Without that, every consuming
+  service's `tsc --noEmit` fails with `Cannot find module 'kafkajs'` on that one
+  shared file, which reads as a code bug but is actually a missed install step.
 
 ---
 
 ## 8. Where to look next
 
-- Exact request/response contract for every route and Kafka topic across all five
+- Exact request/response contract for every route and Kafka topic across all
   services: [`api-contract.md`](./api-contract.md).
 - Deep, code-pasted walkthroughs for admin-service, api-gateway,
-  notification-service, and search-service: `<service>/docs/README.md`.
+  notification-service, search-service, and inventory-service: `<service>/docs/README.md`.
 - Root-level system map and cross-service flow diagrams: `/readme.md`.
-- Standing punch list (may be slightly behind this document, since it predates the
-  discovery of the api-gateway admin-route bug and search-service's new controller
-  bugs in §6): `/missing.md`.
+- Standing punch list: `/missing.md`.

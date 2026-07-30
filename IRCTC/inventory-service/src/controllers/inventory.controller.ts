@@ -1,54 +1,174 @@
-import { Request, Response, NextFunction } from "express";
+import { Request, Response } from "express";
 import { inventoryService } from "../services/inventory.service";
-import { zStation } from "../types/zod";
+import {
+  zLockSeats,
+  zUnlockSeats,
+  zConfirmSeats,
+  zCancelBooking,
+  zSeatFilters,
+} from "../types/zod";
 import { ErrorResponse } from "../utils/api-response";
 import { formatZodError } from "../utils/zod.formatter";
-
 import asyncHandler from "../utils/asyncHandler";
 
 /**
- * POST /stations/station
+ * GET /schedules/:scheduleId/availability
  *
- * Creates a new station. Expects a JSON body matching `zStation`:
- * { name, code, city, state? }.
- *
- * Flow:
- *  1. Validate the body with zStation (this also trims strings and
- *     uppercases `code`) — on failure, respond 400 with the first Zod
- *     issue message.
- *  2. Hand the parsed fields to stationService.createStation, which checks
- *     for a duplicate station code, inserts the row, and publishes a
- *     STATION_CREATED Kafka event.
- *  3. Respond 200.
- *
- * Errors the service throws (e.g. ConflictError on a duplicate code) are
- * normally caught by asyncHandler and forwarded to errorHandler — see the
- * note below on why that doesn't reliably happen here.
+ * Public (no auth) — used by search-service's results page to show seat
+ * counts without exposing per-seat detail.
  */
-const createStation = asyncHandler(
-  async (req: Request, res: Response, next: NextFunction) => {
-    // Validate incoming body against the zStation schema
-    const result = zStation.safeParse(req.body);
-    if (!result.success) {
-      return ErrorResponse(res, 400, {
-        message: formatZodError(result.error),
-      });
-    }
+const getScheduleAvailability = asyncHandler(
+  async (req: Request<{ scheduleId: string }>, res: Response) => {
+    const { scheduleId } = req.params;
 
-    const { name, code, city, state } = result.data;
+    const data = await inventoryService.getAvailability(scheduleId);
 
-    // Note: not awaited. zStation's `code` field already applies
-    // `.toUpperCase()`, so this second `.toUpperCase()` is a no-op on an
-    // already-uppercased value. More importantly, since the returned
-    // promise is neither awaited nor returned, the response below fires
-    // before the DB write / Kafka publish settle, and a rejection here
-    // (e.g. ConflictError on a duplicate code) becomes an unhandled
-    // promise rejection instead of reaching errorHandler.
-    const station = inventoryService.initializeInventory();
-
-    // Message text is a holdover from a different (OTP-based) flow.
-    res.status(200).json({ success: true, message: "OTP sent successfully" });
+    res.status(200).json({ success: true, data });
   },
 );
 
-export const stationController = { createStation };
+/**
+ * GET /schedules/:scheduleId/seats
+ *
+ * Reachable by an end user (via the gateway) or by booking-service (via the
+ * internal service key) — see routes/inventory.routes.ts's userOrInternal.
+ * Optional fromSeq/toSeq query params narrow seat status to a specific
+ * journey segment instead of the whole route.
+ */
+const getScheduleSeats = asyncHandler(async (req: Request<{ scheduleId: string }>, res: Response) => {
+  const { scheduleId } = req.params;
+
+  const result = zSeatFilters.safeParse(req.query);
+  if (!result.success) {
+    return ErrorResponse(res, 400, { message: formatZodError(result.error) });
+  }
+
+  const data = await inventoryService.getSeats(scheduleId, result.data);
+
+  res.status(200).json({ success: true, data });
+});
+
+/**
+ * POST /seats/lock — internal only, called by booking-service while it
+ * holds seats during the create-booking saga.
+ */
+const lockSeats = asyncHandler(async (req: Request, res: Response) => {
+  const result = zLockSeats.safeParse(req.body);
+  if (!result.success) {
+    return ErrorResponse(res, 400, { message: formatZodError(result.error) });
+  }
+
+  const { scheduleId, seatIds, userId, ttlSeconds, fromSeq, toSeq } =
+    result.data;
+
+  const lockResult = await inventoryService.lockSeats(
+    scheduleId,
+    seatIds,
+    userId,
+    ttlSeconds ?? 0,
+    fromSeq,
+    toSeq,
+  );
+
+  res.status(200).json({
+    success: true,
+    message: `${lockResult.lockedSeats.length} seat(s) locked successfully`,
+    data: {
+      scheduleId: lockResult.scheduleId,
+      lockedSeats: lockResult.lockedSeats,
+      lockExpiresAt: lockResult.lockExpiresAt,
+    },
+  });
+});
+
+/** POST /seats/unlock — internal only, releases seats the saga is compensating. */
+const unlockSeats = asyncHandler(async (req: Request, res: Response) => {
+  const result = zUnlockSeats.safeParse(req.body);
+  if (!result.success) {
+    return ErrorResponse(res, 400, { message: formatZodError(result.error) });
+  }
+
+  const { scheduleId, seatIds, userId, fromSeq, toSeq } = result.data;
+
+  const unlockResult = await inventoryService.unlockSeats(
+    scheduleId,
+    seatIds,
+    userId,
+    fromSeq,
+    toSeq,
+  );
+
+  res.status(200).json({
+    success: true,
+    message: `${unlockResult.unlockedSeats.length} seat(s) unlocked successfully`,
+    data: {
+      scheduleId: unlockResult.scheduleId,
+      unlockedSeats: unlockResult.unlockedSeats,
+    },
+  });
+});
+
+/** POST /seats/confirm — internal only, called once payment succeeds. */
+const confirmSeats = asyncHandler(async (req: Request, res: Response) => {
+  const result = zConfirmSeats.safeParse(req.body);
+  if (!result.success) {
+    return ErrorResponse(res, 400, { message: formatZodError(result.error) });
+  }
+
+  const { scheduleId, seatIds, bookingId, userId, fromSeq, toSeq } =
+    result.data;
+
+  const confirmResult = await inventoryService.confirmSeats(
+    scheduleId,
+    seatIds,
+    userId,
+    bookingId,
+    fromSeq,
+    toSeq,
+  );
+
+  res.status(200).json({
+    success: true,
+    message: `${confirmResult.confirmedSeats.length} seat(s) confirmed`,
+    data: {
+      scheduleId: confirmResult.scheduleId,
+      bookingId: confirmResult.bookingId,
+      confirmedSeats: confirmResult.confirmedSeats,
+    },
+  });
+});
+
+/** POST /seats/cancel-booking — internal only, releases a confirmed booking's seats. */
+const cancelBooking = asyncHandler(async (req: Request, res: Response) => {
+  const result = zCancelBooking.safeParse(req.body);
+  if (!result.success) {
+    return ErrorResponse(res, 400, { message: formatZodError(result.error) });
+  }
+
+  const { scheduleId, bookingId } = result.data;
+
+  const cancelResult = await inventoryService.cancelBooking(
+    scheduleId,
+    bookingId,
+    result.data.userId,
+  );
+
+  res.status(200).json({
+    success: true,
+    message: `Booking cancelled, ${cancelResult.releasedSeats.length} seat(s) released`,
+    data: {
+      scheduleId: cancelResult.scheduleId,
+      bookingId: cancelResult.bookingId,
+      releasedSeats: cancelResult.releasedSeats,
+    },
+  });
+});
+
+export const inventoryController = {
+  getScheduleAvailability,
+  getScheduleSeats,
+  lockSeats,
+  unlockSeats,
+  confirmSeats,
+  cancelBooking,
+};

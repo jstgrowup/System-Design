@@ -4,7 +4,9 @@ import { KAFKA_TOPICS } from "../../../../shared/constants/kafka-topics";
 import {
   Station,
   Train,
+  Seat,
   Route,
+  RouteStation,
   Schedule,
   ScheduleStatus,
   SeatType,
@@ -20,6 +22,18 @@ interface ScheduleCancelledEvent {
   eventType: "SCHEDULE_CANCELLED";
   data: Schedule;
   timestamp: string;
+}
+
+/**
+ * Denormalized route snapshot consumed by search-service's indexTrainRoute —
+ * it reads `train` (for trainId/trainNumber/trainName/seats) and
+ * `routeStations` (each including its related `station`) directly off this
+ * event, so both need to be inlined rather than just publishing the raw
+ * Prisma `Route` row.
+ */
+export interface RouteCreatedPayload extends Route {
+  train: Train & { seats: Seat[] };
+  routeStations: (RouteStation & { station: Station })[];
 }
 
 /**
@@ -59,14 +73,10 @@ export interface ScheduleCreatedPayload {
  * admin-related events (station/train/route/schedule lifecycle).
  * Lazily connects the producer on first use rather than at import time.
  *
- * Only publishStationCreated (station.service.ts) and publishTrainCreated
- * (train.service.ts) are actually reached today. publishRouteCreated is
- * fully implemented but the call site in train.service.ts's createRoute is
- * commented out. publishScheduleCreated takes the denormalized
- * ScheduleCreatedPayload above (not a raw Prisma Schedule row) and is
- * called from schedule.service.ts — but that service is itself unreachable
- * via HTTP because schedule.route.ts is never mounted in server.ts.
- * publishScheduleCancelled has no caller anywhere in this codebase.
+ * publishStationCreated, publishTrainCreated, publishRouteCreated, and
+ * publishScheduleCreated are all reachable from their respective services.
+ * publishScheduleCancelled has no caller anywhere in this codebase — there's
+ * no schedule-cancellation feature (route/controller/service) built yet.
  */
 class AdminProducer {
   private isInitialized: boolean;
@@ -158,10 +168,13 @@ class AdminProducer {
   }
 
   /**
-   * Publishes a route-created event.
+   * Publishes a route-created event. Takes the denormalized
+   * RouteCreatedPayload (not a raw Prisma `Route`) so search-service's
+   * indexTrainRoute — which reads `train` and `routeStations` off the event
+   * directly — has everything it needs without calling back into this service.
    */
-  async publishRouteCreated(routeData: Route) {
-    return this.sendMessage<Route>(
+  async publishRouteCreated(routeData: RouteCreatedPayload) {
+    return this.sendMessage<RouteCreatedPayload>(
       KAFKA_TOPICS.ROUTE_CREATED,
       `route-${routeData.id}`,
       routeData,

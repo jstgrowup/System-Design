@@ -11,6 +11,7 @@ import { reqLogger } from "./middlewares/req.middleware";
 import searchRoutes from "./routes/search.routes";
 import searchConsumer from "./kafka/search.service";
 import { disconnectAll } from "./config/kafka";
+import { notFound } from "./middlewares/not-found.middleware";
 import { errorMiddleware } from "./middlewares/error.middleware";
 
 const app = express();
@@ -44,6 +45,7 @@ app.use(searchRoutes);
 app.get("/health", (req: Request, res: Response) =>
   res.json({ status: "ok", service: config.SERVICE_NAME }),
 );
+app.use(notFound);
 app.use(errorMiddleware);
 
 const startServer = async (): Promise<void> => {

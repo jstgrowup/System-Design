@@ -4,7 +4,7 @@ import { config } from "../config";
 
 const corsOptions: CorsOptions = {
   // Splits a comma-separated string of origins from your config into an array
-  origin: config.ALLOWED_ORIGINS.split(","),
+  origin: config.ALLOWED_ORIGINS ? config.ALLOWED_ORIGINS.split(",") : [],
 
   credentials: true,
 

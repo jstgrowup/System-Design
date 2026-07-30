@@ -7,6 +7,7 @@ import { corsMiddleware } from "./middlewares/cors.middleware";
 import errorHandler from "./middlewares/error.middleware";
 import { reqLogger } from "./middlewares/req.middleware";
 import authRoutes from "./routes/auth.route";
+import userRoutes from "./routes/user.route";
 const app = express();
 
 app.use(helmet());
@@ -15,8 +16,9 @@ app.use(reqLogger);
 app.use(cookieParser());
 app.use(express.json());
 app.use("/api/v1/auth", authRoutes);
+app.use("/user", userRoutes);
 app.get("/", (req, res) => {
-  res.send("Hello from index.js of user-service");
+  res.send("Hello from user-service");
 });
 
 app.get("/health", (req, res) => {

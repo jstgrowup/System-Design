@@ -73,9 +73,6 @@ export const generateAndStoreOtp = async (meta: {
  * Verifies a submitted OTP against the HMAC stored in Redis.
  * Tracks failed attempts and blocks after exceeding the max.
  * Deletes the session from Redis on success to prevent reuse.
- *
- * NOTE: There is a typo bug here — `hasedOtp` should be `hashedOtp`.
- * This will cause verification to always fail. Fix: change `hasedOtp` → `hashedOtp`.
  */
 export const verifyOtpViaUnHashing = async ({
   otp,
@@ -88,7 +85,6 @@ export const verifyOtpViaUnHashing = async ({
   const rawData = await redis.get(`otp:session:${otpSessionId}`);
   if (!rawData) return null; // session expired or never existed
 
-  // ⚠️ BUG: `hasedOtp` is a typo — should be `hashedOtp` to match what was stored
   const { hashedOtp: storedOtp, meta } = JSON.parse(rawData);
 
   // Track failed verification attempts to prevent brute force
