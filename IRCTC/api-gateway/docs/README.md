@@ -80,7 +80,16 @@ It does not implement business logic itself — every real operation (login, boo
                     └───────────────────────────┘
 ```
 
-Only **2 business routes** are currently wired up (`src/routes/index.ts`): user login and get-profile, both proxied to the user service. The other six service URLs are configured (`src/config/index.ts`) but have no routes defined yet — the gateway is set up to support them, but doesn't proxy to them today.
+This section (and the route-count claims elsewhere in this doc) predates several
+routes that exist in the code today — `src/routes/index.ts` also has two
+`GET /admins/*` routes (registered before this pass), five
+`POST`/`GET /bookings/bookings*` routes proxying to booking-service, and one
+`POST /payments/webhooks/razorpay` route proxying to payment-service (both added
+once those services existed — see their own docs). This doc's route-by-route
+walkthroughs below were not fully re-audited to match — treat the specific
+"only 2 routes" framing as outdated, and the
+[Known Issues](#known-issues--inconsistencies) section's route-count claim as
+similarly due for a refresh.
 
 ---
 
@@ -581,7 +590,7 @@ Observed while reviewing the code — documented here rather than fixed, since t
 5. **The Razorpay-webhook raw-body branch in `index.ts`** checks for `req.path === "/api/payments/webhooks/razorpay"`, but no `/payments/*` route exists in `routes/index.ts` yet — currently unreachable code, harmless but dead until a payments route is added.
 6. **`RedisClient.closeConnection()`, `isReady()`, `testConnection()`** are defined in `config/redis.ts` but never called anywhere — the Redis connection isn't closed during `gracefulShutdown()` in `index.ts`, and there's no health endpoint reporting Redis status.
 7. **`getCircuitBreakerStatus()`** (in `services/proxy.ts`) is exported but not called by any route — there's no way to inspect circuit breaker state over HTTP today.
-8. **Six of seven configured service URLs have no routes** — `SEARCH_SERVICE_URL`, `ADMIN_SERVICE_URL`, `NOTIFICATION_SERVICE_URL`, `BOOKING_SERVICE_URL`, `PAYMENT_SERVICE_URL`, `INVENTORY_SERVICE_URL` are all configured and have circuit breakers pre-created, but only `userService` is ever proxied to from `routes/index.ts`.
+8. **Some configured service URLs still have no routes** — `SEARCH_SERVICE_URL`, `NOTIFICATION_SERVICE_URL`, and `INVENTORY_SERVICE_URL` are all configured and have circuit breakers pre-created, but no route in `routes/index.ts` proxies to any of them. `userService` and `adminService` were already proxied to before this pass; `bookingService` and `paymentService` (webhook only) were added across two later passes (see booking-service's and payment-service's own docs) — four of seven downstream services are now reachable in principle, three of them once the login-routing bug elsewhere in this doc is fixed (the payment webhook route needs no JWT, so it isn't blocked by that bug — only by the lack of a real Razorpay account to send one).
 9. **`src/types/index.ts` is empty** — no shared types are defined there despite the file existing.
 10. **`BadRequestError`, `ForbiddenError`, `ConflictError`, `InternalServerError`** are defined in `utils/error.ts` but nothing in the current codebase throws them.
 

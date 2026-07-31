@@ -50,4 +50,19 @@ const createStation = asyncHandler(
   },
 );
 
-export const stationController = { createStation };
+/**
+ * GET /stations/station/internal/:stationId
+ *
+ * Internal-only (behind internalAuth's shared-secret header) — resolves a
+ * station by id for another backend service. booking-service uses this to
+ * attach a station's name to a booking-confirmed email.
+ */
+const getStationByIdInternal = asyncHandler(
+  async (req: Request<{ stationId: string }>, res: Response) => {
+    const { stationId } = req.params;
+    const station = await stationService.getStationById(stationId);
+    res.status(200).json({ success: true, data: station });
+  },
+);
+
+export const stationController = { createStation, getStationByIdInternal };

@@ -41,6 +41,9 @@ class EmailConsumer {
 
       logger.info("Email consumer connected to Kafka");
 
+      // KAFKA_TOPICS is shared across every service, so this subscribes to
+      // admin/inventory/payment/DLQ topics too, not just the ones handled
+      // below — those all fall through to the "Unknown topic" warning.
       await consumer.subscribe({
         topics: Object.values(KAFKA_TOPICS),
         fromBeginning: false,
@@ -151,6 +154,8 @@ class EmailConsumer {
 
   /** Sends a booking-failed email. Skips silently if no email is present on the event. */
   private async handleBookingFailed(data: BookingFailedData): Promise<void> {
+    // same cast as handleBookingConfirmed — BookingFailedData doesn't declare
+    // `email` either, pending the real payload including it
     const email = (data as unknown as { email?: string }).email;
     const { bookingId } = data;
 
@@ -169,6 +174,8 @@ class EmailConsumer {
   private async handleBookingCancelled(
     data: BookingCancelledData,
   ): Promise<void> {
+    // same cast as handleBookingConfirmed — BookingCancelledData doesn't
+    // declare `email` either, pending the real payload including it
     const email = (data as unknown as { email?: string }).email;
     const { bookingId } = data;
 

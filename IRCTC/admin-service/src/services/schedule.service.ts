@@ -90,7 +90,10 @@ const createSchedule = async ({ trainId, departureDate }: ScheduleBodyType) => {
     })),
   };
 
-  // This event goes to both inventory-service and search-service via Kafka
+  // This event goes to both inventory-service and search-service via Kafka.
+  // Unlike trainService/routeService's publishes, this isn't wrapped in a
+  // .catch — a Kafka failure here throws and (since the controller awaits
+  // this inside asyncHandler) turns an already-committed schedule into a 500.
   await adminProducer.publishScheduleCreated(eventPayload);
   return "";
 };

@@ -1,7 +1,7 @@
 # IRCTC Backend — API & Kafka Contract (As-Is)
 
 This is a status-annotated reference for every HTTP route and Kafka topic that
-exists in this repo's code, across all six services. It documents **current
+exists in this repo's code, across all eight services. It documents **current
 behavior, including bugs** — not the contract as it was intended to work. For the
 narrative "how does this all fit together and why is it broken" version, see
 [`implementation-plan.md`](./implementation-plan.md) in this same folder.
@@ -37,14 +37,20 @@ servicePath = "/" + req.path.split("/").filter(Boolean).slice(1).join("/")
 forwardedUrl = `${serviceBaseUrl}${servicePath}${queryString}`
 ```
 
-### `POST /api/users/auth/login` — ❌ BROKEN
+### `POST /api/users/auth/login` — ✅ WORKING (fixed)
 - Middleware: `endpointRateLimit(10, 900_000)` (10 req / 15 min per IP+endpoint) → proxy
 - No auth required (this route issues the token)
 - Rewrite: `/users/auth/login` → strips `users` → forwards to `userService/auth/login`
   → `http://localhost:4001/auth/login`
-- **Why broken**: user-service actually mounts login at `/api/v1/auth/login`, not
-  `/auth/login`. The one-segment strip can never reproduce the `/api/v1` prefix.
-  Every login attempt through the gateway 404s against user-service.
+- **Was broken, now fixed**: user-service used to mount login at `/api/v1/auth/login`,
+  which the gateway's one-segment-strip rewrite could never reproduce (it can only
+  ever forward to `/auth/login`, never `/api/v1/auth/login`). Fixed by dropping the
+  version prefix on user-service's side — `server.ts` now mounts auth routes at
+  plain `/auth`, matching the no-prefix convention every other service in this repo
+  already uses, and matching the reference implementation. **Not verified live** —
+  no reachable user-service/Redis/Postgres in the environment this was fixed in, so
+  this is confirmed by re-reading the rewrite logic against the new mount path, not
+  an observed request.
 
 ### `GET /api/users/user/profile` — ❌ BROKEN (doubly)
 - Middleware: `requireAuth` → `combinedRateLimit()` (100/15min per IP + 1000/15min
@@ -71,17 +77,57 @@ forwardedUrl = `${serviceBaseUrl}${servicePath}${queryString}`
   `http://localhost:4003/trains/train`
 - **Why broken**: admin-service mounts `POST /trains/train` only; this route is `GET`.
 
+### `POST /api/bookings/bookings` — ⚠️ WIRED, but blocked by the login bug
+- Middleware: `requireAuth` → `endpointRateLimit(5, 60_000)` (5/min) → proxy
+- Rewrite: `/bookings/bookings` → strips `bookings` → forwards to
+  `http://localhost:4005/bookings` — **matches** booking-service's own
+  `POST /bookings` mount exactly (unlike the login/admin routes above, this
+  path-rewrite is correct).
+- **Why still not reachable end-to-end**: `requireAuth` needs a valid JWT, and the
+  only way to get one is `POST /api/users/auth/login` — which is the Tier-1 bug
+  above. Once that's fixed, this route works as configured. Booking-service itself
+  also can't complete a booking yet regardless — payment-service now exists, but
+  there's no real Razorpay merchant account to test its gateway calls against —
+  see booking-service's and payment-service's own docs.
+
+### `GET /api/bookings/bookings` — ⚠️ WIRED, same caveat as above
+- Middleware: `requireAuth` → `combinedRateLimit()` → proxy → `/bookings` on booking-service.
+
+### `GET /api/bookings/bookings/:bookingId` — ⚠️ WIRED, same caveat as above
+- Rewrite → `/bookings/:bookingId` on booking-service — matches.
+
+### `POST /api/bookings/bookings/:bookingId/verify-payment` — ⚠️ WIRED, same caveat as above
+- Rewrite → `/bookings/:bookingId/verify-payment` on booking-service — matches.
+
+### `POST /api/bookings/bookings/:bookingId/cancel` — ⚠️ WIRED, same caveat as above
+- Rewrite → `/bookings/:bookingId/cancel` on booking-service — matches.
+
+### `POST /api/payments/webhooks/razorpay` — ✅ WIRED (public, no auth)
+- No middleware except the raw-body branch already in `index.ts` (written ahead
+  of this route, before payment-service existed) → proxy.
+- Rewrite: `/payments/webhooks/razorpay` → strips `payments` → forwards to
+  `http://localhost:4006/webhooks/razorpay` — **matches** payment-service's own
+  mount exactly, including the raw `Buffer` body the gateway now forwards
+  through to payment-service's signature check unmodified.
+- **Why this is genuinely reachable in principle, unlike the booking routes
+  above**: this route needs no JWT at all (Razorpay calls it directly, and
+  payment-service verifies its own webhook signature) — it isn't blocked by the
+  login-routing bug. The only reason it can't be exercised for real is that
+  there's no live Razorpay account configured to actually send a webhook.
+
 ### `GET /api/gateway/health` — ✅ WORKING
 - No middleware, no proxy — self-contained.
 - Response: `200 { success: true, message: "Gateway is healthy", timestamp: new Date().toString() }`
 
 ### Configured but never wired to a route
-5 of the gateway's 7 known downstream services have a `config.SERVICES.*` URL and a
-pre-built circuit breaker, but **no `createProxy()` call anywhere references them** —
-`searchService` (4002), `notificationService` (4004), `bookingService` (4005 in
-`.env`, code default 4005),`paymentService` (4006), `inventoryService` (4007,
-code default only — not in `.env`). Only `userService` and `adminService` are ever
-proxied to.
+2 of the gateway's 7 known downstream services still have a `config.SERVICES.*`
+URL and a pre-built circuit breaker but **no `createProxy()` call anywhere
+references them**: `searchService` (4002), `notificationService` (4004).
+`inventoryService` (4007) also has no route yet — every one of inventory-service's
+HTTP routes is still only reachable by calling it directly. `userService`,
+`adminService`, `bookingService`, and now `paymentService` (webhook only — its
+internal routes have no gateway route, by design, since booking-service is meant
+to call them directly with the shared secret) are the four ever proxied to.
 
 ### Circuit breaker
 Per-service `CLOSED → OPEN → HALF_OPEN` state machine. `CIRCUIT_BREAKER_THRESHOLD`
@@ -120,13 +166,15 @@ explicit args. All three set `X-RateLimit-*` response headers; rejection adds
 now provides it) — **not verified live**, no reachable Postgres/Redis/Kafka in
 the environment this was fixed in.
 
-Mounted in `server.ts`: `app.use("/api/v1/auth", authRoutes)` and
+Mounted in `server.ts`: `app.use("/auth", authRoutes)` and
 `app.use("/user", userRoutes)` (this second one was never mounted before — every
 route in `routes/user.route.ts` was ⛔ UNREACHABLE). Global middleware:
 `helmet → corsMiddleware → reqLogger → cookieParser → express.json → routes →
-errorHandler`.
+errorHandler`. `authRoutes` used to be mounted at `/api/v1/auth` — dropped the
+version prefix (now plain `/auth`) so the gateway's generic one-segment-strip
+rewrite can actually reach it; see `/api/users/auth/login`'s entry in §1.
 
-### `POST /api/v1/auth/send-otp` — ✅ WORKING
+### `POST /auth/send-otp` — ✅ WORKING
 **Body** (`zSendOtp`):
 ```ts
 firstName: string, min 4, max 40, trimmed
@@ -147,7 +195,7 @@ field on this path, unlike the ones below), `409 { error: "CONFLICT", message:
 "User already exists" }`, `429 { error: "OTP_RATE_LIMIT", message: "Too many OTP
 requests. Try again later" }`.
 
-### `POST /api/v1/auth/verify-otp` — ✅ WORKING
+### `POST /auth/verify-otp` — ✅ WORKING
 **Body** (`zVerifyOtp`): `otp: string, exactly 6 digits`.
 **Flow**: reads `otp_session` cookie (missing → `400 BadRequestError("OTP session
 is missing")`) → looks up `otp:session:<id>` in Redis → checks attempt cap
@@ -163,7 +211,7 @@ responding, this one didn't. `sendWelcomeEmail` also used to exist and be fully
 wired on the notification-service side but was never called here — it's called now.
 **Success**: `201 { message: "Account is created", data: <safeUser, no password field> }`.
 
-### `POST /api/v1/auth/login` — ✅ WORKING
+### `POST /auth/login` — ✅ WORKING
 **Body** (`zLogin`): same email/password shape as send-otp.
 **Flow**: look up user by email (not found, or no password set — e.g. an
 OAuth-only stub — → `400 BadRequestError("Email not found")`) → `bcrypt.compare`
@@ -180,7 +228,7 @@ plus both tokens set as httpOnly/secure/sameSite=strict cookies (`accessToken`,
 **Errors**: `400` (zod), `400 { error:"BAD_REQUEST", message:"Email not found" }`,
 `400 { error:"BAD_REQUEST", message:"Incorrect password" }`.
 
-### `POST /api/v1/auth/refresh` — ✅ WORKING (mostly)
+### `POST /auth/refresh` — ✅ WORKING (mostly)
 No body — reads the `refreshToken` cookie.
 **Flow**: missing cookie → `401 UnauthorizedError("Refresh token is missing",
 "LOGIN_AGAIN")` → `jwt.verify` against `JWT_REFRESH_SECRET` → look up
@@ -557,7 +605,193 @@ IdempotencyRecord(id, eventKey unique, processedAt)`.
 
 ---
 
-## 7. Full Kafka topic matrix
+## 7. Booking Service (port 4005)
+
+**Builds and typechecks** (`tsc --noEmit` passes clean) — **not verified live**, no
+reachable Postgres/Redis/Kafka in the environment this was built in, and no Prisma
+migration has even been generated yet. Ported from `irctc-backend-main/booking-service`
+(a plain-JS reference implementation) into TypeScript. Every route below is mounted
+in `server.ts` at root, behind `getUserContext` (the gateway's `x-user-id` header) —
+there is no internal-only or public route here, unlike inventory-service.
+
+### `POST /bookings` — ✅ WORKING (logic-wise)
+**Body** (`zCreateBooking`): `scheduleId: uuid`, `seatIds: string[]` (min 1),
+`passengers: {name, age, gender: MALE|FEMALE|OTHER}[]` (same length as `seatIds`),
+`idempotencyKey: string`, optional `fromStationId`/`toStationId: uuid` and
+`fromSeq`/`toSeq: positive int` (segment booking — if both seq values are given,
+`fromSeq` must be less than `toSeq`).
+**Flow**: checks `idempotencyKey` against `IdempotencyRecord` (a retried request
+returns the original response, not a duplicate booking) → calls inventory-service's
+`GET /schedules/:id/availability` (rejects a non-`ACTIVE` or already-departed
+schedule) → `GET /schedules/:id/seats` to price and validate each requested seat →
+acquires an all-or-nothing Redis lock on the sorted seat set → creates the `Booking`
+row (+ `BookingSeat`/`Passenger` children, status `PENDING`) → saga step 1: `POST
+/seats/lock` on inventory-service (status → `SEATS_HELD`) → saga step 2: `POST
+/orders` on payment-service (status → `PAYMENT_PENDING`, stores `paymentOrderId`).
+Any failure at any step compensates everything already completed and releases the
+Redis lock. **Depends on payment-service, which doesn't exist in this repo** — the
+saga will always fail at step 2 today (`ECONNREFUSED` after 3 retries), and the
+booking ends up `FAILED` with its seat hold released.
+**Success**: `201 { success: true, data: { bookingId, status, totalAmount,
+lockExpiresAt, seats, passengers, paymentOrder: {paymentOrderId, gatewayOrderId,
+amount, currency, keyId} } }`.
+
+### `GET /bookings` — ✅ WORKING (logic-wise)
+**Query params** (`zGetUserBookings`): `status?` (any `BookingStatus` value),
+`page?` (default 1), `limit?` (default 10, max 100).
+**Success**: `200 { success: true, data: { bookings: [...], pagination: {page,
+limit, total, totalPages} } }` — only the caller's own bookings, newest first.
+
+### `GET /bookings/:bookingId` — ✅ WORKING (logic-wise)
+`404 NotFoundError` if the booking doesn't exist *or* belongs to a different
+user — the two cases are indistinguishable in the response, deliberately, so a
+client can't enumerate other users' booking IDs.
+**Success**: `200 { success: true, data: <BookingDetail> }`.
+
+### `POST /bookings/:bookingId/verify-payment` — ✅ WORKING (logic-wise)
+**Body** (`zVerifyPayment`): `razorpayPaymentId`, `razorpaySignature` (both
+required strings). Client-side path for a browser that completes checkout
+directly and wants an immediate synchronous confirmation, separate from the
+`payment.success` Kafka path. Calls payment-service's `POST
+/orders/:paymentOrderId/verify` — **depends on payment-service**, same caveat as
+`POST /bookings`.
+**Success**: `200 { success: true, data: { bookingId, paymentStatus } }`.
+
+### `POST /bookings/:bookingId/cancel` — ✅ WORKING (logic-wise)
+Works from any non-terminal status. `409 ConflictError` if already
+`CANCELLED`/`CANCELLING`/`FAILED`/`EXPIRED`/`CONFIRMING`. If `CONFIRMED`, releases
+seats via inventory-service and attempts a refund via payment-service (refund
+failure is logged, not thrown — cancellation still succeeds; see booking-service's
+own docs for why). If `PAYMENT_PENDING`/`SEATS_HELD`, just releases the held seats.
+**Success**: `200 { success: true, message: "Booking cancelled successfully",
+data: { bookingId, status: "CANCELLED", refundInitiated } }`.
+
+### Kafka — consumer (`kafka/consumer/booking.consumer.ts`, group
+`booking-service-group`)
+| Topic | Handler | Status |
+|---|---|---|
+| `payment.success` | `handlePaymentSuccess` — confirms seats, marks the booking `CONFIRMED` | ⏳ never fires end-to-end — payment-service now publishes this correctly, but neither service has been run live, and payment-service has no real Razorpay credentials to ever actually capture a payment |
+| `payment.failed` | `handlePaymentFailure` — releases held seats, marks the booking `FAILED` | ⏳ never fires end-to-end — same reason |
+| `admin.schedule-cancelled` | `handleScheduleCancelled` — cancels every active booking on that schedule, refunds confirmed ones | ⏳ never fires — no caller anywhere in admin-service (no cancel-schedule feature exists) |
+
+Both idempotent via CAS on `Booking.version`, not a separate `IdempotencyRecord`
+row (unlike inventory-service's Kafka handlers) — re-delivery of the same event is
+a safe no-op because the handler's status precondition (e.g. `booking.status ===
+"PAYMENT_PENDING"`) will already be false the second time through.
+
+### Kafka — producer (`kafka/producer/booking.producer.ts`)
+| Method | Topic | Payload | Called from |
+|---|---|---|---|
+| `publishBookingConfirmed` | `booking.confirmed` | booking + train + seats + passengers + station names, **including `email`/`firstName`** | `handlePaymentSuccess` |
+| `publishBookingCancelled` | `booking.cancelled` | bookingId + reason + refundAmount, **including `email`/`firstName`** | `cancelBooking`, `handleScheduleCancelled` |
+| `publishBookingFailed` | `booking.failed` | bookingId + reason, **including `email`/`firstName`** | `handlePaymentFailure`, `handleScheduleCancelled`'s expiry-job counterpart |
+
+All three enrich the event with the user's `email`/`firstName` via `userClient`
+(an internal call to user-service's `GET /user/internal/:userId`) before
+publishing — this is what makes notification-service's `booking.confirmed`/
+`failed`/`cancelled` handlers (which read `.email` off the event, previously
+always `undefined` since nothing ever populated it) actually able to send an
+email, once these topics start firing.
+
+### Data model
+`Booking(id, userId, scheduleId, trainId, trainNumber, trainName, departureDate,
+status enum, totalAmount, seatCount, fromStationId?, toStationId?, fromSeq?,
+toSeq?, idempotencyKey unique, paymentOrderId unique?, lockExpiresAt?,
+failureReason?, version) · BookingSeat(id, bookingId, seatId, seatNumber, seatType,
+price; unique[bookingId,seatId]) · Passenger(id, bookingId, name, age, gender,
+seatId?) · SagaLog(id, bookingId, step enum, status enum, request json?, response
+json?, error?) · IdempotencyRecord(id, eventKey unique, response json?,
+processedAt)`.
+
+---
+
+## 8. Payment Service (port 4006)
+
+**Builds and typechecks** (`tsc --noEmit` passes clean) — **not verified live**,
+no reachable Postgres/Kafka in the environment this was built in, and no real
+Razorpay merchant account exists to test any gateway call against even if there
+were. Ported from `irctc-backend-main/payment-service`. Every route is mounted at
+root and behind `internalAuth` (a shared secret) except the public webhook — this
+service has no user-facing routes at all.
+
+### `POST /orders` — ✅ WORKING (logic-wise, blocked by missing credentials)
+**Body** (`zCreatePaymentOrder`): `bookingId: string`, `amount: positive number`,
+`userId: string`, `idempotencyKey: string`.
+**Flow**: checks `idempotencyKey` against `IdempotencyRecord` → calls the active
+gateway's `createOrder(amount, "INR", bookingId, {bookingId, userId})` → creates a
+`PaymentOrder` row (status `CREATED`) with the gateway's own order id → writes a
+`PaymentAuditLog` row (`ORDER_CREATED`). **Fails today**: `RazorpayGateway`
+requires real `RAZORPAY_KEY_ID`/`RAZORPAY_KEY_SECRET`, which don't exist in this
+environment — every call reaches Razorpay's real API and gets an auth error.
+**Success**: `201 { success: true, data: { paymentOrderId, gatewayOrderId,
+amount, currency, status, gatewayProvider, keyId } }`.
+
+### `GET /orders/:paymentOrderId` — ✅ WORKING (logic-wise)
+Returns the full `PaymentOrder` row plus its `auditLogs` and `refunds` relations,
+newest-first — no field-level DTO shaping, unlike the other four routes (ported
+as-is from the reference, which had none either).
+**Success**: `200 { success: true, data: <PaymentOrder + auditLogs + refunds> }`.
+`404 NotFoundError` if the id doesn't exist.
+
+### `POST /orders/:paymentOrderId/verify` — ✅ WORKING (logic-wise, same credential caveat)
+**Body** (`zVerifyAndCapture`): `gatewayPaymentId: string`, `gatewaySignature: string`.
+**Flow**: idempotent if already `CAPTURED` (returns immediately with a
+`message`) → `409 ConflictError` if not `CREATED` → verifies the signature via
+HMAC-SHA256 (`crypto.timingSafeEqual`) → on success, captures (status →
+`CAPTURED`) and publishes `payment.success`; on failure, marks `FAILED`,
+publishes `payment.failed`, and throws `400 BadRequestError("Payment signature
+verification failed", "INVALID_SIGNATURE")`.
+**Success**: `200 { success: true, data: { paymentOrderId, status, gatewayPaymentId } }`.
+
+### `POST /refunds` — ✅ WORKING (logic-wise, same credential caveat)
+**Body** (`zInitiateRefund`): `paymentOrderId: string`, `amount: positive number`,
+`reason?: string`, `idempotencyKey: string`.
+**Flow**: idempotency check → `409` unless status is `CAPTURED`/`PARTIALLY_REFUNDED`
+→ `409` if no `gatewayPaymentId` exists yet → validates
+`totalRefunded + amount <= paymentOrder.amount` (a `400` before any gateway call
+if it would exceed) → calls the gateway's `initiateRefund` → creates a `Refund`
+row (status `INITIATED`) → updates `PaymentOrder.status` to `REFUND_INITIATED`.
+**Success**: `201 { success: true, data: { refundId, paymentOrderId, status,
+amount, gatewayRefundId } }`.
+
+### `POST /webhooks/razorpay` — ✅ WORKING (logic-wise) — the only public route
+No auth — instead, `gateway.verifyWebhookSignature` checks the
+`x-razorpay-signature` header via HMAC against the raw request body (mounted
+with `express.raw()`, registered before `express.json()` in `server.ts` so the
+bytes reach this handler unparsed). `400` on missing/invalid signature.
+**Flow**: parses the raw body → looks up the `PaymentOrder` by the webhook's
+`gatewayOrderId` (`{status:"ignored", reason:"order_not_found"}` if none matches)
+→ writes a `PaymentAuditLog` row for the raw payload → dispatches on `event`:
+`payment.captured`/`payment.authorized` → capture (same as verify's success
+path); `payment.failed` → mark `FAILED`, publish `payment.failed`;
+`refund.processed`/`refund.created` → marks the matching `Refund` `COMPLETED`
+and recomputes the parent order's status (`REFUNDED` vs `PARTIALLY_REFUNDED`
+based on the running total); anything else → `{status:"ignored", event}`.
+**Always responds `200`** for any recognized event, specifically so Razorpay's
+webhook delivery system stops retrying — this is true even for `"ignored"`
+outcomes.
+**Success**: `200 <WebhookHandlingResult>` (shape varies by event/outcome).
+
+### Kafka — producer only (`kafka/producer/payment.producer.ts`)
+| Method | Topic | Called from |
+|---|---|---|
+| `publishPaymentSuccess` | `payment.success` | `handlePaymentCaptured` (webhook path), `verifyAndCapturePayment` (client-verify success path) |
+| `publishPaymentFailed` | `payment.failed` | `handlePaymentFailed` (webhook path), `verifyAndCapturePayment` (signature-failure path) |
+
+This service has no Kafka **consumer** — it never subscribes to anything.
+
+### Data model
+`PaymentOrder(id, bookingId, userId, amount, currency default "INR", status
+enum, idempotencyKey unique, gatewayProvider default "razorpay", gatewayOrderId
+unique?, gatewayPaymentId unique?, gatewaySignature?, failureReason?, metadata
+json?, version) · Refund(id, paymentOrderId, amount, reason?, status enum,
+idempotencyKey unique, gatewayRefundId unique?, failureReason?, metadata json?)
+· PaymentAuditLog(id, paymentOrderId, action, gatewayResponse json?, metadata
+json?) · IdempotencyRecord(id, eventKey unique, response json?, processedAt)`.
+
+---
+
+## 9. Full Kafka topic matrix
 
 | Topic | Producer(s) | Consumer(s) | End-to-end status |
 |---|---|---|---|
@@ -570,10 +804,10 @@ IdempotencyRecord(id, eventKey unique, processedAt)`.
 | `admin.route-created` | admin-service (`createRoute`, now publishes `{...route, train}` matching the consumer's expected shape) | search-service (`indexTrainRoute`) | ⏳ never fires end-to-end — same as `admin.station-created` above |
 | `admin.schedule-created` | admin-service (`createSchedule`, route now mounted) | search-service (`indexSchedule`), inventory-service (`initializeInventory`) | ⏳ never fires end-to-end — all three services now build, but none has been run live |
 | `admin.train-updated` / `admin.station-updated` / `admin.route-updated` | no producer implemented for any | none | ⏳ n/a |
-| `admin.schedule-cancelled` | admin-service — zero call sites, no cancel-schedule feature built | search-service (`cancelSchedule`), inventory-service (`cancelScheduleInventory`) | ⏳ never fires |
+| `admin.schedule-cancelled` | admin-service — zero call sites, no cancel-schedule feature built | search-service (`cancelSchedule`), inventory-service (`cancelScheduleInventory`), booking-service (`handleScheduleCancelled`) | ⏳ never fires |
 | `inventory.seat-availability-updated` | inventory-service (every seat-mutating operation) | search-service (`updateSeatAvailability`) | ⏳ never fires end-to-end — inventory-service can now publish it, but only once it receives a `SCHEDULE_CREATED` event to seed a schedule first, and neither service has been run live |
-| `booking.confirmed` / `booking.failed` / `booking.cancelled` | no booking-service exists | notification-service (would silently no-op — missing `email` field) | ⏳ never fires |
-| `payment.success` / `payment.failed` | no payment-service exists | notification-service (falls to `default`) | ⏳ n/a |
+| `booking.confirmed` / `booking.failed` / `booking.cancelled` | booking-service (`handlePaymentSuccess`/`handlePaymentFailure`/`cancelBooking`/`handleScheduleCancelled`) — **now includes an `email` field on every publish** | notification-service (would now actually send an email — the previously-missing `email` field is populated) | ⏳ never fires end-to-end yet — booking-service only reaches most of these publish sites via `payment.success`/`payment.failed`, which payment-service can't actually fire without real Razorpay credentials |
+| `payment.success` / `payment.failed` | payment-service (`handlePaymentCaptured`/`handlePaymentFailed`/`verifyAndCapturePayment`) — both fully implemented and publish correctly | booking-service (`handlePaymentSuccess`/`handlePaymentFailure`, both fully implemented and subscribed) | ⏳ never fires end-to-end — payment-service can't reach a real `CAPTURED`/`FAILED` state without a live Razorpay account to call, and neither service has been run live regardless |
 | `dlq.booking-service` | n/a (would-be DLQ target) | notification-service (falls to `default`) | inert |
 | `dlq.inventory-service` | inventory-service, on 3 failed retries | none | effectively inert (nothing consumes this service's own DLQ) |
 | `dlq.search-service` | search-service, on 3 failed retries — internal catch blocks that used to make this rarely reached are now fixed, so it triggers on a genuine Elasticsearch outage | none | fires when it should now, still nothing consumes it |
@@ -584,7 +818,7 @@ service's `withDLQ` wrapper (`shared/utils/dlqHanlder.ts`).
 
 ---
 
-## 8. Shared error-response shapes
+## 10. Shared error-response shapes
 
 Every service's `errorMiddleware` produces one of two shapes:
 - Thrown `AppError` subclass → `{ success: false, error: <code>, message: <message> }`
@@ -611,11 +845,13 @@ thrown `AppError` or a hand-called `ErrorResponse`.
 
 ---
 
-## 9. Services referenced but not implemented in this repo
+## 11. Services referenced but not implemented in this repo
 
-`booking-service` and `payment-service` each have a `config.SERVICES.*` URL in
-api-gateway and/or Kafka topics named for them (`booking.*`, `payment.*`), but
-**no directory, code, or `docs/` folder for either exists anywhere in this
-repo.** Any reference to them elsewhere in this document describes what other
-services *expect* to talk to, not something that can currently be exercised.
-(`inventory-service` used to be listed here too — it's now built, see §6.)
+None — every service named anywhere in this repo's config, Kafka topic
+constants, and gateway `SERVICES.*` map now has a real directory, code, and
+`docs/README.md` (`inventory-service`, `booking-service`, and `payment-service`
+were the three that used to be listed here; see §6, §7, and §8). What's still
+missing is not a *service*, but real Razorpay credentials to exercise
+payment-service's gateway calls against, and admin-service's cancel-schedule
+feature — both are runtime/feature gaps within existing services, tracked in
+`missing.md`, not unbuilt services.

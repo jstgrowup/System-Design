@@ -32,7 +32,9 @@ flowchart TB
         AS["Admin Service — 4003<br/>Stations, trains, routes, schedules"]
         SS["Search Service — 4002<br/>Search for trains/stations"]
         NS["Notification Service — 4004<br/>Sends emails"]
-        Ghost["Booking / Payment / Inventory<br/>Services — 4005 / 4006 / 4007<br/>⚠️ talked about everywhere,<br/>but do not exist in this repo yet"]
+        BS["Booking Service — 4005<br/>Orchestrates the booking saga<br/>(seats + payment), segment bookings"]
+        PS["Payment Service — 4006<br/>Razorpay gateway adapter,<br/>webhook + client-verify capture"]
+        IS["Inventory Service — 4007<br/>Seat availability + segment locks"]
     end
 
     subgraph InfraBox["Shared Infrastructure (not code — just servers)"]
@@ -47,17 +49,26 @@ flowchart TB
     GW -.->|"configured, but no working\nroute reaches these today"| AS
     GW -.-> SS
     GW -.-> NS
-    GW -.-> Ghost
+    GW -.->|"routes now wired up on the\ngateway side, but blocked by\nthe same login-routing bug"| BS
+    GW -.->|"webhook route wired up,\nno real Razorpay account\nto test against"| PS
+    GW -.-> IS
 
     US --> PG
     US --> RD
     AS --> PG
     SS --> ES
+    BS --> PG
+    BS --> RD
+    PS --> PG
+    IS --> PG
 
     US -- "announces: 'a new OTP\nneeds emailing'" --> KF
     AS -- "announces: 'a new station\n/ train was created'" --> KF
+    BS -- "announces: 'a booking was\nconfirmed / cancelled / failed'" --> KF
+    PS -- "announces: 'a payment\nsucceeded / failed'" --> KF
     KF -- delivered to --> NS
     KF -- delivered to --> SS
+    KF -- delivered to --> BS
 ```
 
 **Read this diagram as:** a client only ever talks to the **API Gateway**.
@@ -85,7 +96,8 @@ on exactly where and why in section 6.
 | **Search Service**                         | 4002               | The "find a train" feature, backed by Elasticsearch instead of the regular database, for fast searching.                                                                                               | ✅ Code complete, typechecks. ⚠️ Not verified live (no reachable Elasticsearch/Kafka in this environment) |
 | **Notification Service**                   | 4004               | A background worker with no real webpage of its own. It just listens for "someone needs an email" announcements on Kafka and sends them.                                                               | ✅ Runs correctly as designed                                                                       |
 | **Inventory Service**                      | 4007               | Tracks how many seats are left on a train's schedule (available/locked/booked), including partial-journey seat locking so two passengers can share a seat across non-overlapping legs.                | ✅ Code complete, typechecks. ⚠️ Not verified live (no reachable DB/Kafka in this environment) — can now receive real events from Admin Service in principle, see §5 |
-| **Booking / Payment Services**             | 4005 / 4006        | Would handle seat booking and payments.                                                                                                                                                                 | ❌ Don't exist in this repository — only their _names_ and Kafka topics are reserved for the future |
+| **Booking Service**                        | 4005               | The orchestrator. Holds seats, opens a payment order, confirms or rolls everything back depending on what happens — the one service that talks to every other service for a single request.           | ✅ Code complete, typechecks. ⚠️ Not verified live — and its two hardest dependencies (Inventory Service, Payment Service) are themselves not verified live / not built at all |
+| **Payment Service**                        | 4006               | Takes payment via a gateway adapter (Razorpay today) and tells Booking Service whether it succeeded, via a webhook + a client-side verify path.                                                          | ✅ Code complete, typechecks. ⚠️ Not verified live — and there's no real Razorpay merchant account to test the gateway calls against even once Postgres/Kafka are reachable |
 
 Everything is written in **TypeScript** with **Express** (a web framework),
 and each service is its own standalone program with its own `package.json` —
@@ -307,6 +319,8 @@ flowchart LR
         US2["User Service"]
         AS2["Admin Service"]
         IS2["Inventory Service"]
+        BS2["Booking Service"]
+        PS2["Payment Service"]
     end
 
     subgraph Topics["Kafka Topics (channels)"]
@@ -316,14 +330,17 @@ flowchart LR
         T4["admin.train-created"]
         T5["admin.route-created"]
         T6["admin.schedule-created"]
+        T6b["admin.schedule-cancelled"]
         T8["inventory.seat-availability-updated"]
-        T7["booking.* / payment.* topics"]
+        T9["booking.confirmed / .cancelled / .failed"]
+        T7["payment.success / .failed"]
     end
 
     subgraph Listeners["Services that LISTEN for things"]
         NS2["Notification Service"]
         SS2["Search Service"]
         IS2L["Inventory Service"]
+        BS2L["Booking Service"]
     end
 
     US2 -->|"actually publishes"| T1 --> NS2
@@ -341,23 +358,38 @@ flowchart LR
     T6 --> SS2
     T6 --> IS2L
 
+    AS2 -.->|"no cancel-schedule<br/>feature built — never fires"| T6b
+    T6b -.-> SS2
+    T6b -.-> IS2L
+    T6b -.-> BS2L
+
     IS2 -->|"publishes"| T8 --> SS2
 
-    T7 -.->|"nobody publishes these —<br/>booking/payment\nservices don't exist yet"| T7b["(nobody's listening either)"]
+    BS2 -->|"publishes"| T9 --> NS2
+
+    PS2 -->|"publishes"| T7 --> BS2L
 ```
 
-**The short version:** as of this pass, admin-service, search-service, and
-inventory-service all build and typecheck, so every solid arrow above is now
-structurally wired end-to-end at the code level — `admin.station-created`,
-`admin.route-created`, and `admin.schedule-created` all leave Admin Service
-correctly, and both Search Service and Inventory Service have real handlers
-waiting for them. **None of this has actually been observed working**,
-though — this was verified with `tsc --noEmit` in a sandbox with no reachable
-Postgres, Elasticsearch, or Kafka, so treat the solid arrows as "should work"
+**The short version:** as of this pass, admin-service, search-service,
+inventory-service, booking-service, and now payment-service all build and
+typecheck, so every solid arrow above is now structurally wired end-to-end at
+the code level — `admin.station-created`, `admin.route-created`, and
+`admin.schedule-created` all leave Admin Service correctly, and Search
+Service, Inventory Service, Booking Service, and Booking Service (as a
+listener for `payment.*`) all have real handlers waiting for their respective
+events. Booking Service's own `booking.confirmed`/`booking.cancelled`/
+`booking.failed` events now carry an `email` field, so notification-service's
+handlers for those three topics — previously only able to send an email if
+the payload happened to have one — can actually work once these events start
+flowing. **None of this has actually been observed working**, though — this
+was verified with `tsc --noEmit` in a sandbox with no reachable Postgres,
+Elasticsearch, Redis, or Kafka (and, for payment-service specifically, no real
+Razorpay merchant account exists to test the gateway calls against even if
+infrastructure were reachable), so treat the solid arrows as "should work"
 rather than "confirmed working." `notification.otp-email` (User → Notification)
 remains the one flow anyone has actually watched succeed. Dotted lines are
 still genuinely unbuilt: `notification.welcome-email` has no caller, and
-`booking.*`/`payment.*` have no publisher because those services don't exist yet.
+`admin.schedule-cancelled` has no caller (no cancel-schedule feature exists).
 
 ---
 
@@ -371,7 +403,8 @@ still genuinely unbuilt: `notification.welcome-email` has no caller, and
 | Search Service                | ⚠️ Not verified live (code complete, typechecks) | ❌ | Not proxied through the Gateway yet; nothing has actually published an event to it live either |
 | Notification Service          | ✅ Yes                      | ✅ Yes, as a background worker (no web routes to test) | —                                                              |
 | Inventory Service             | ⚠️ Not verified live (code complete, typechecks) | ❌ | Not proxied through the Gateway yet, and its one real trigger (Admin Service's schedule creation) hasn't been exercised live either |
-| Booking / Payment             | —                           | —                                                      | Don't exist in this repo yet                                   |
+| Booking Service               | ⚠️ Not verified live (code complete, typechecks) | ❌ | Proxied through the Gateway now, but blocked by the same login-routing bug; its saga will still fail at the payment step without real Razorpay credentials behind Payment Service |
+| Payment Service               | ⚠️ Not verified live (code complete, typechecks) | ❌ | Its webhook route is proxied through the Gateway now, but there's no real Razorpay merchant account to exercise a gateway call against |
 
 None of the above are being fixed as part of this document — this is a
 snapshot of what the code actually does today, so anyone picking this repo
@@ -449,3 +482,5 @@ and a full list of known bugs/dead code found while writing it:
 | [`search-service/docs/README.md`](search-service/docs/README.md)             | Elasticsearch indexing + search logic                                         |
 | [`notification-service/docs/README.md`](notification-service/docs/README.md) | The Kafka-driven email worker                                                  |
 | [`inventory-service/docs/README.md`](inventory-service/docs/README.md)       | Seat inventory, segment locking, the lock-expiry job — including why it's untested live |
+| [`booking-service/docs/README.md`](booking-service/docs/README.md)           | The booking saga, distributed seat locking, CAS-based state transitions, the expiry job |
+| [`payment-service/docs/README.md`](payment-service/docs/README.md)           | The Razorpay gateway adapter pattern, the webhook vs. client-verify capture paths, refund validation — including why there's no real merchant account to test against |

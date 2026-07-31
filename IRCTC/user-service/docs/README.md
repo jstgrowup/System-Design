@@ -48,11 +48,11 @@ The **User Service** owns user identity for the whole system — it's the only s
 │                                                                          │
 │   POST /api/users/auth/login → strips "users" → forwards to            │
 │     http://localhost:4001/auth/login                                   │
-│   ❌ BROKEN — user-service actually mounts login at                    │
-│     /api/v1/auth/login, not /auth/login. The gateway's one-segment     │
-│     strip can never reproduce the /api/v1 prefix, so every login       │
-│     attempt routed through the gateway 404s. Unchanged by this         │
-│     session — this is a gateway-side bug, not something touched here.  │
+│   ✅ FIXED — this service used to mount login at /api/v1/auth/login,  │
+│     which the gateway's one-segment strip could never reproduce. Now  │
+│     mounted at plain /auth (no version prefix), matching every other  │
+│     service in this repo, so the rewrite lands correctly. Not verified │
+│     live — confirmed by re-reading the rewrite against the new mount.  │
 │                                                                          │
 │   GET /api/users/user/profile → forwards to                            │
 │     http://localhost:4001/user/profile                                 │
@@ -65,7 +65,7 @@ The **User Service** owns user identity for the whole system — it's the only s
 │     Reason (2) is fixed now (see below); reason (1), the method        │
 │     mismatch, is a separate gateway-side bug this pass didn't touch.   │
 └────────────────────────────┬────────────────────────────────────────--┘
-                             │ (both gateway routes above still 404 as
+                             │ (the profile route above still 404s as
                              │  described; every flow verified in this
                              │  doc was exercised by calling user-service
                              │  directly at :4001, not through the gateway)
@@ -75,7 +75,8 @@ The **User Service** owns user identity for the whole system — it's the only s
 │                                                                            │
 │  server.ts:                                                               │
 │   helmet() → corsMiddleware → reqLogger → cookieParser → express.json()  │
-│   → app.use("/api/v1/auth", authRoutes)                                  │
+│   → app.use("/auth", authRoutes)  ◄── was /api/v1/auth, dropped the      │
+│        version prefix so the gateway's rewrite can reach it              │
 │   → app.use("/user", userRoutes)  ◄── NEW this session — user.route.ts   │
 │        was fully written before but never app.use()'d anywhere            │
 │   → GET /, GET /health                                                    │
@@ -135,7 +136,7 @@ user-service/
 │   │   ├── auth.service.ts                # OTP issuance/verification, login, token rotation
 │   │   └── user.service.ts                # Cache-first profile read/update/delete
 │   ├── routes/
-│   │   ├── auth.route.ts                  # Mounted at /api/v1/auth
+│   │   ├── auth.route.ts                  # Mounted at /auth (was /api/v1/auth)
 │   │   └── user.route.ts                  # Mounted at /user — NEW this session (existed
 │   │                                      #   before, was never app.use()'d)
 │   ├── kafka/producer/
@@ -180,7 +181,7 @@ Two files that no longer exist, both removed this session: **`config/db.ts`** (a
 ### Case A: Signup happy path — `send-otp` → `verify-otp` (both fixes from this session land here)
 
 ```
-1.  Client sends POST /api/v1/auth/send-otp with
+1.  Client sends POST /auth/send-otp with
       { firstName, lastName?, email, password }
 2.  zSendOtp.safeParse validates: firstName 4-40 chars, email a valid email
     (trimmed + lowercased), password >= 8 chars with at least one uppercase,
@@ -205,7 +206,7 @@ Two files that no longer exist, both removed this session: **`config/db.ts`** (a
 6.  Response: 200 { success: true, message: "OTP sent successfully" } — the
     OTP itself and the session id are never in the JSON body, only the cookie
 
-7.  Client reads the OTP from their email, sends POST /api/v1/auth/verify-otp
+7.  Client reads the OTP from their email, sends POST /auth/verify-otp
     with { otp } — the otp_session cookie rides along automatically
 8.  zVerifyOtp.safeParse validates otp is exactly 6 digits
 9.  Controller reads req.cookies.otp_session — missing → 400 BadRequestError
@@ -238,7 +239,7 @@ Two files that no longer exist, both removed this session: **`config/db.ts`** (a
 ### Case B: Edge case — a stolen refresh token gets reused after the real user already rotated it
 
 ```
-1.  A user logs in normally on their laptop: POST /api/v1/auth/login issues
+1.  A user logs in normally on their laptop: POST /auth/login issues
     accessToken + refreshToken (with a random jti embedded), and
     authservice.login stores that jti at refresh:<userId>:<deviceId> in
     Redis (deviceId = first 16 hex chars of sha256(user-agent|ip|accept))
@@ -246,7 +247,7 @@ Two files that no longer exist, both removed this session: **`config/db.ts`** (a
     a leaked log, an XSS before httpOnly was added, a backup, etc.) — but
     the real user's browser has ALSO been calling /refresh normally in the
     meantime, each time rotating to a brand-new jti
-3.  The attacker sends POST /api/v1/auth/refresh with their stale
+3.  The attacker sends POST /auth/refresh with their stale
     refreshToken cookie, from a device whose fingerprint happens to match
     (or an environment set up to mimic it)
 4.  rotateRefreshToken: jwt.verify succeeds (the token itself isn't expired
@@ -331,7 +332,7 @@ app.use(corsMiddleware);
 app.use(reqLogger);
 app.use(cookieParser());
 app.use(express.json());
-app.use("/api/v1/auth", authRoutes);
+app.use("/auth", authRoutes);
 app.use("/user", userRoutes);
 app.get("/", (req, res) => {
   res.send("Hello from user-service");
@@ -347,7 +348,7 @@ app.use(errorHandler);
 export default app;
 ```
 
-The one change this session: `app.use("/user", userRoutes)` is new. `routes/user.route.ts` was fully written before this session — every handler existed, including the internal route added this session — but nothing in `server.ts` ever mounted it, so the whole file was unreachable from outside the process. Auth routes stay at `/api/v1/auth`, matching what the root `readme.md` and `docs/api-contract.md` already describe. `config` and `logger` are imported here but neither is actually used in this file's own body (`config.PORT`/`logger.*` aren't referenced) — both imports are otherwise dead in this specific file, though `config` and `logger` are very much used elsewhere in the service.
+The one change this session: `app.use("/user", userRoutes)` is new. `routes/user.route.ts` was fully written before this session — every handler existed, including the internal route added this session — but nothing in `server.ts` ever mounted it, so the whole file was unreachable from outside the process. Auth routes have since moved to plain `/auth` (they used to be at `/api/v1/auth`) — dropping the version prefix is what let the API Gateway's login route actually reach this service; see this doc's Architecture section and the root `readme.md`/`docs/api-contract.md` for the full story. `config` and `logger` are imported here but neither is actually used in this file's own body (`config.PORT`/`logger.*` aren't referenced) — both imports are otherwise dead in this specific file, though `config` and `logger` are very much used elsewhere in the service.
 
 ---
 
@@ -1152,10 +1153,10 @@ Notes on the fields flagged unused above:
 
 | Method & Path | Auth | Status |
 |---|---|---|
-| `POST /api/v1/auth/send-otp` | none (this establishes identity) | Already working before this session. |
-| `POST /api/v1/auth/verify-otp` | none (OTP session cookie) | Already working before this session; this session fixed a password-hash leak and added the welcome-email publish. |
-| `POST /api/v1/auth/login` | none (this establishes identity) | Already working before this session. |
-| `POST /api/v1/auth/refresh` | refresh token cookie | Already working before this session. An expired/tampered token surfaces as a generic `500`, not a clean `401` — `jwt.verify`'s thrown error isn't an `AppError` subclass. |
+| `POST /auth/send-otp` | none (this establishes identity) | Already working before this session. |
+| `POST /auth/verify-otp` | none (OTP session cookie) | Already working before this session; this session fixed a password-hash leak and added the welcome-email publish. |
+| `POST /auth/login` | none (this establishes identity) | Already working before this session. |
+| `POST /auth/refresh` | refresh token cookie | Already working before this session. An expired/tampered token surfaces as a generic `500`, not a clean `401` — `jwt.verify`'s thrown error isn't an `AppError` subclass. |
 | `POST /user/profile` | `x-user-id` (gateway) | Handler always existed; unreachable before this session because `user.route.ts` was never mounted. Now mounted and reachable. |
 | `PUT /user/profile` | `x-user-id` (gateway) | Was an empty `// TODO` stub that would hang the request forever if reached. Implemented and mounted this session. |
 | `DELETE /user/profile` | `x-user-id` (gateway) | Same as `PUT` — was a hanging stub, implemented and mounted this session. |
@@ -1198,7 +1199,7 @@ Postgres, Redis, and Kafka all need to be reachable at the URLs above — none w
 curl http://localhost:4001/health
 # { "message": "ok" }
 
-curl -X POST http://localhost:4001/api/v1/auth/send-otp \
+curl -X POST http://localhost:4001/auth/send-otp \
   -H "Content-Type: application/json" \
   -c cookies.txt \
   -d '{"firstName":"Subham","email":"subham@example.com","password":"Passw0rd1"}'
@@ -1207,7 +1208,7 @@ curl -X POST http://localhost:4001/api/v1/auth/send-otp \
 # actual OTP, or check user-service's own logs / the notification.otp-email
 # topic directly if no mail provider is configured)
 
-curl -X POST http://localhost:4001/api/v1/auth/verify-otp \
+curl -X POST http://localhost:4001/auth/verify-otp \
   -H "Content-Type: application/json" \
   -b cookies.txt \
   -d '{"otp":"123456"}'
@@ -1237,7 +1238,7 @@ curl -X GET http://localhost:4001/user/internal/<some-user-id> \
 
 Observed while reviewing the code — documented here rather than fixed, per this repo's own documentation convention (never fix while documenting):
 
-1. **Both gateway-routed paths into this service are broken, for reasons entirely on the API Gateway's side.** `POST /api/users/auth/login` forwards to `/auth/login`, but this service mounts login at `/api/v1/auth/login` — every gateway-routed login attempt 404s. `GET /api/users/user/profile` forwards to `/user/profile`, but this service only ever defines `POST`/`PUT`/`DELETE /profile`, not `GET` — a method mismatch independent of the mounting fix made this session. Neither is something this documentation pass (or the session that produced the code changes it describes) touched; both are gateway-side bugs.
+1. ~~Both gateway-routed paths into this service are broken~~ **Login is fixed.** `POST /api/users/auth/login` forwards to `/auth/login`, and this service now mounts login at exactly that path (it used to be `/api/v1/auth/login`, which the gateway's one-segment-strip rewrite could never reach — dropping the version prefix, to match every other service in this repo, is the fix). `GET /api/users/user/profile` is **still broken**, for reasons entirely on the API Gateway's side: it forwards to `/user/profile`, but this service only ever defines `POST`/`PUT`/`DELETE /profile`, not `GET` — a method mismatch, unrelated to the mounting fix. That one is still a gateway-side bug, not something this pass touched.
 2. **This session's own work — the profile routes, the internal route, and the six correctness fixes described throughout this doc — has been verified with `npx tsc --noEmit` only.** No Postgres, Redis, or Kafka broker was reachable in this environment, so none of it has been exercised live. The pre-existing auth flow (send-otp/verify-otp/login/refresh) is described elsewhere in this repo (root `readme.md` §4) as "fully working end-to-end," but that claim comes from an earlier audit whose own verification methodology isn't known from this session — take it as background context, not something re-confirmed here.
 3. **`hashToken` (in `utils/auth.ts`) is exported but never called anywhere in this service.** It SHA-256-hashes a token string — presumably intended for safely storing/comparing a raw token value — but nothing in the current auth flow uses it (refresh-token reuse detection works entirely off the JWT's own `jti` claim compared against Redis, not a hash of the token itself).
 4. **`AuthenticatedRequest` (imported from `shared/types/index.ts` into `user.controller.ts`) doesn't appear to be used as an actual type annotation anywhere in that file's current handler signatures** — every handler is typed against plain `Request` instead (see the [types/ section](#5-types--validation-schemas--express-augmentation) for why: the shared type's `user` field is required, which doesn't compose with Express's own optional-`user` augmentation). Worth checking if a future edit reintroduces this import without actually needing it.

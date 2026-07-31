@@ -16,6 +16,9 @@ class InventoryConsumer {
 
     await consumer.subscribe({
       topics: [KAFKA_TOPICS.SCHEDULE_CREATED, KAFKA_TOPICS.SCHEDULE_CANCELLED],
+      // Replays full topic history on a fresh deployment/consumer group so a
+      // new instance rebuilds inventory state from scratch; safe only because
+      // each handler checks IdempotencyRecord before applying an event.
       fromBeginning: true,
     });
 

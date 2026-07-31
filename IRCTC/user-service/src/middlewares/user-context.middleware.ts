@@ -2,8 +2,10 @@ import { Request, Response, NextFunction } from "express";
 import { UnauthorizedError } from "../utils/error";
 
 /**
- * Extract user context from gateway headers.
- * Gateway sets x-user-id after JWT verification (discussed in video).
+ * Extracts the caller's user ID from the x-user-id header set by the API
+ * gateway after it verifies the JWT. This middleware performs no verification
+ * of its own — it trusts the header outright — so it must only sit behind
+ * routes reachable exclusively through the gateway, never exposed directly.
  */
 export function getUserContext(
   req: Request,

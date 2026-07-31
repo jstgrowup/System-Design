@@ -460,6 +460,9 @@ const lockSeats = async (
             WHERE "scheduleId" = ${scheduleId}
             AND "seatId" = ANY(${seatIds}::text[])
             AND status IN ('LOCKED', 'BOOKED')
+            -- Standard interval-overlap test: two ranges overlap unless one
+            -- ends at/before the other starts. Equivalent form of the same
+            -- check used in getSeats above.
             AND "fromSeq" < ${toSeq}
             AND "toSeq" > ${fromSeq}
             FOR UPDATE NOWAIT

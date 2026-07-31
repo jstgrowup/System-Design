@@ -65,6 +65,60 @@ gatewayRouter.get(
   combinedRateLimit(),
   adminServiceProxy,
 );
+
+// ============================================
+// BOOKING SERVICE ROUTES (authenticated)
+// ============================================
+const bookingServiceProxy = createProxy(
+  "bookingService",
+  config.SERVICES.BOOKING_SERVICE_URL,
+);
+
+gatewayRouter.post(
+  "/bookings/bookings",
+  requireAuth,
+  endpointRateLimit(5, 60000), // 5 booking attempts per minute — booking creation is expensive/sensitive
+  bookingServiceProxy,
+);
+gatewayRouter.get(
+  "/bookings/bookings",
+  requireAuth,
+  combinedRateLimit(),
+  bookingServiceProxy,
+);
+gatewayRouter.get(
+  "/bookings/bookings/:bookingId",
+  requireAuth,
+  combinedRateLimit(),
+  bookingServiceProxy,
+);
+gatewayRouter.post(
+  "/bookings/bookings/:bookingId/verify-payment",
+  requireAuth,
+  combinedRateLimit(),
+  bookingServiceProxy,
+);
+gatewayRouter.post(
+  "/bookings/bookings/:bookingId/cancel",
+  requireAuth,
+  combinedRateLimit(),
+  bookingServiceProxy,
+);
+
+// ============================================
+// PAYMENT SERVICE ROUTES
+// ============================================
+const paymentServiceProxy = createProxy(
+  "paymentService",
+  config.SERVICES.PAYMENT_SERVICE_URL,
+);
+
+// Public — no auth. Razorpay calls this directly; payment-service verifies
+// the request itself via its own webhook signature, not a JWT. This also
+// activates the raw-body middleware branch in index.ts, which was written
+// for this exact path before payment-service existed.
+gatewayRouter.post("/payments/webhooks/razorpay", paymentServiceProxy);
+
 // ============================================
 // ROUTE 3: Gateway Health Check
 // ============================================

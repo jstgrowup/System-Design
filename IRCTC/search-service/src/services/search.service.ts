@@ -390,6 +390,10 @@ const searchTrains = async ({
     return { trains: [], message: `Station "${from}" not found` };
   if (!toStation) return { trains: [], message: `Station "${to}" not found` };
 
+  // A `nested` query only proves *some* route entry matched — it doesn't say
+  // which one. Named inner_hits ("from_station"/"to_station") recover the
+  // specific matched stop (and its sequenceNumber) so the direction check
+  // below has something to compare.
   const query = {
     bool: {
       must: [
@@ -429,6 +433,10 @@ const searchTrains = async ({
         !src ||
         !fromHit ||
         !toHit ||
+        // A train that stops at both stations doesn't necessarily run from
+        // one to the other — it might visit them in the reverse order.
+        // sequenceNumber is the stop's position on the route, so `from`
+        // must come strictly before `to` for this to be a valid direction.
         fromHit.sequenceNumber >= toHit.sequenceNumber
       ) {
         return null;

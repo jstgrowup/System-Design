@@ -31,6 +31,7 @@ Single source of truth for the IRCTC Admin Service: what it does, how a request 
 The **Admin Service** is the internal API for setting up the data the rest of IRCTC runs on — stations, trains, routes, and schedules. As it exists today:
 
 - **Creates stations** (`POST /stations/station`) — name, code, city, optional state
+- **Resolves a station internally** (`GET /stations/station/internal/:stationId`) — new since booking-service was ported, behind a shared-secret `internalAuth` middleware (the same pattern inventory-service and user-service already use), so booking-service can attach a station's name to a booking-confirmed email without a JWT
 - **Creates trains** (`POST /trains/train`) — train number, name, coach, and a full seat map in one call
 - **Defines a train's route** (`POST /trains/route`) — an ordered list of stations with arrival/departure times and distances. This now correctly succeeds for a brand-new train (a previously-inverted existence check is fixed — see [Request Lifecycle](#request-lifecycle))
 - **Creates schedules** (`POST /schedules/schedule`) — a specific `departureDate` run of a train that already has a route, denormalized with train + seats + route into a single Kafka event. This router is now mounted in `server.ts` and reachable over HTTP (it previously wasn't)
@@ -38,7 +39,7 @@ The **Admin Service** is the internal API for setting up the data the rest of IR
 - **Validates** every request body with Zod before touching the database
 - **Persists** through Prisma into Postgres (`stations`, `trains`, `seats`, `routes`, `route_stations`, `schedules`)
 - **Publishes Kafka events** so other services (inventory, search) can react — all four creation events (`admin.station-created`, `admin.train-created`, `admin.route-created`, `admin.schedule-created`) now actually fire; `admin.schedule-cancelled` still never fires, because there's no cancel-schedule feature built (see [Kafka Topics Reference](#kafka-topics-reference))
-- **Requires a user context on every route** — `getUserContext` middleware (reading an `x-user-id` header) is now mounted on all station, train, and schedule routes. This service was previously running with zero auth wired up anywhere.
+- **Requires a user context on every route** — `getUserContext` middleware (reading an `x-user-id` header) is now mounted on all station, train, and schedule routes. This service was previously running with zero auth wired up anywhere. The one exception is the new internal station-lookup route, which is behind `internalAuth` (a shared secret) instead — it's meant for another backend service to call, not a request proxied from the gateway.
 
 There's still no update or delete endpoint for any resource, and no read/list endpoint for stations, routes, or schedules — `getTrainById` is the only working read path in the service.
 
@@ -128,15 +129,15 @@ admin-service/
 │   │   ├── logger.ts                     # Winston logger
 │   │   └── prisma.ts                     # PrismaClient singleton (pg adapter)
 │   ├── controllers/
-│   │   ├── station.controller.ts         # POST /stations/station
+│   │   ├── station.controller.ts         # POST /stations/station, GET /stations/station/internal/:stationId
 │   │   ├── train.controller.ts           # POST /trains/train, POST /trains/route, GET /trains/train/:trainId
 │   │   └── schedule.controller.ts        # POST /schedules/schedule
 │   ├── services/
-│   │   ├── station.service.ts            # Station creation + Kafka publish
+│   │   ├── station.service.ts            # Station creation + Kafka publish; internal-lookup read
 │   │   ├── train.service.ts              # Train+seats creation, route creation (existence-check bug fixed), getTrainById
 │   │   └── schedule.service.ts           # Schedule creation + denormalized Kafka publish
 │   ├── routes/
-│   │   ├── station.route.ts              # getUserContext + stationController.createStation
+│   │   ├── station.route.ts              # getUserContext + createStation; internalAuth + getStationByIdInternal
 │   │   ├── train.routes.ts               # getUserContext + trainController's 3 handlers
 │   │   └── schedule.route.ts             # getUserContext + scheduleController.createSchedule — now mounted at /schedules in server.ts
 │   ├── kafka/producer/
@@ -145,7 +146,8 @@ admin-service/
 │   │   ├── cors.middleware.ts            # ALLOWED_ORIGINS split is now undefined-safe
 │   │   ├── error.middleware.ts
 │   │   ├── req.middleware.ts
-│   │   └── user-context.middleware.ts    # Now actually mounted on every route
+│   │   ├── user-context.middleware.ts    # Now actually mounted on every route
+│   │   └── internal-auth.middleware.ts   # NEW — shared-secret check, guards the internal station-lookup route
 │   ├── types/
 │   │   ├── zod.ts                        # zStation, zSeat, zTrain, zRouteStation, zRoute, zSchedule schemas
 │   │   └── express.d.ts                  # NEW this pass — augments Express.Request with `user`
@@ -628,8 +630,47 @@ const createStation = async ({ code, name, city, state }: StationBodyType) => {
   return createdStation;
 };
 
-export const stationService = { createStation };
+/**
+ * Looks up a station by id — used by the internal-only lookup route so
+ * other services (currently booking-service, to attach a station's name to
+ * a booking-confirmed email) can resolve a station without a JWT.
+ */
+const getStationById = async (id: string) => {
+  const station = await prisma.station.findUnique({ where: { id } });
+  if (!station) {
+    throw new NotFoundError("Station not found");
+  }
+  return station;
+};
+
+export const stationService = { createStation, getStationById };
 ```
+
+**New this pass**: `GET /stations/station/internal/:stationId`, behind `internalAuth` rather than `getUserContext` — a shared-secret header check (`x-internal-service-key`), the same pattern already used by inventory-service's and user-service's own internal routes. The controller side:
+
+```typescript
+const getStationByIdInternal = asyncHandler(
+  async (req: Request<{ stationId: string }>, res: Response) => {
+    const { stationId } = req.params;
+    const station = await stationService.getStationById(stationId);
+    res.status(200).json({ success: true, data: station });
+  },
+);
+
+export const stationController = { createStation, getStationByIdInternal };
+```
+
+And the route mount, in `routes/station.route.ts`:
+
+```typescript
+router.get(
+  "/station/internal/:stationId",
+  internalAuth,
+  stationController.getStationByIdInternal,
+);
+```
+
+This exists specifically to unblock booking-service's `stationClient.ts`, which calls this exact path (`/stations/station/internal/:stationId`) to resolve a station's name for segment-booking confirmation emails. `getStationById` throws the same `NotFoundError` pattern as every other lookup in this service — a nonexistent station id is a clean `404`, not a silent `null`.
 
 The comment above the Kafka publish is itself now slightly stale — it still describes the "never awaits this function" behavior that was true before this pass, but the controller now does await it. The underlying fact that remains true is that this publish still isn't wrapped in a `.catch`, unlike `trainService.createTrain` — a Kafka failure here still throws, and now that the controller awaits the call, that rejection really would surface as a 500 from `errorHandler` if the broker were down.
 
@@ -1241,6 +1282,10 @@ curl -X POST http://localhost:4003/schedules/schedule \
   -H "Content-Type: application/json" \
   -H "x-user-id: 11111111-1111-1111-1111-111111111111" \
   -d '{"trainId":"<train-uuid>","departureDate":"2026-08-01"}'
+
+# NEW — internal-only, for another backend service (booking-service), not the gateway:
+curl http://localhost:4003/stations/station/internal/<station-uuid> \
+  -H "x-internal-service-key: <same value as INTERNAL_SERVICE_KEY>"
 ```
 
 ---
@@ -1271,10 +1316,10 @@ Observed while reviewing the current code — documented here rather than fixed,
 4. **Unrelated dependencies remain in `package.json`**: `@langchain/cohere`, `@langchain/core`, `@langchain/groq`, `@langchain/openai`, `mongoose`, `otp-generator`, `resend`, `bcrypt`, `jsonwebtoken`, `ioredis`, `http-status` are all still listed, and a repo-wide check in this pass confirms nothing under `src/` imports any of them — not even now that `types/index.ts` (which used to import `mongoose`) has been deleted. The package.json itself wasn't trimmed.
 5. **`npm run seed` still points at `src/services/seed.ts`**, which still doesn't exist — running that script still fails. The same issue is flagged in the API Gateway's and Notification Service's docs, likely from a shared `package.json` origin.
 6. **`config.NODE_ENV` is defined but nothing reads it.** `config/prisma.ts` checks the raw `process.env.NODE_ENV` directly (`if (process.env.NODE_ENV !== "production")`) instead of going through `config.NODE_ENV` — both currently resolve to the same value, so this is an inconsistency rather than a bug, but it means the `config` object isn't the single source of truth it looks like it should be.
-7. **`config.INTERNAL_SERVICE_KEY` is read into the config object, but nothing under `src/` reads `config.INTERNAL_SERVICE_KEY` anywhere.** It looks like groundwork for a future internal-service-to-service auth check (e.g. verifying a shared secret on requests that don't come through the gateway) that hasn't been wired up yet.
+7. ~~`config.INTERNAL_SERVICE_KEY` is read into the config object, but nothing under `src/` reads it anywhere~~ **No longer true.** `middlewares/internal-auth.middleware.ts` (new, added to support booking-service's `stationClient`) reads `config.INTERNAL_SERVICE_KEY` and compares it against the `x-internal-service-key` header on `GET /stations/station/internal/:stationId` — this field is genuinely consumed now.
 8. **`scheduleService.createSchedule` still returns `""`** (an empty string), not the created schedule or the event payload it just built and published — a caller still has no way to get the new schedule back from this function's return value alone.
 9. **`scheduleService.createSchedule`'s "train has no seats" check still throws a copy-pasted message**: `if (existingTrain.seats.length === 0) throw new BadRequestError("Train not found")` — the message says "not found" for a train that was clearly just found; the real condition is "has zero seats." Not touched in this pass.
-10. **No read/list/update/delete endpoints exist for stations**, and there's still no update/delete for trains, routes, or schedules. `getTrainById` is the only working read endpoint in the entire service today.
+10. **No user-facing read/list/update/delete endpoints exist for stations** — the new `GET /stations/station/internal/:stationId` is internal-only (behind `internalAuth`, for other services), not something an end user or the admin UI can call through the gateway. There's still no update/delete for trains, routes, or schedules either. `getTrainById` remains the only user-facing read endpoint in the entire service today.
 11. **`getUserContext` trusts the `x-user-id` header at face value.** It doesn't verify a JWT itself — it just checks the header is present and 401s if not. This is the same trust-the-gateway model used elsewhere in this repo (api-gateway does the real JWT verification and sets the header before proxying), but it's worth knowing explicitly: anything that can set that header directly — a misconfigured proxy, or a caller hitting admin-service's port without going through the gateway — can claim to be any user id.
 
 None of the above are being changed as part of this documentation pass — flagging them here so they're visible next time someone works on this service.

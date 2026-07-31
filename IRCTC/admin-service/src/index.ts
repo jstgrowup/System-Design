@@ -1,6 +1,9 @@
 import dotenv from "dotenv";
 dotenv.config();
 
+// Must stay above the imports below — config/index.ts reads process.env at
+// module-load time, and CommonJS require() (this project's module target)
+// runs each import in file order, so dotenv.config() executes first.
 import app from "./server";
 import { config } from "./config";
 import logger from "./config/logger";

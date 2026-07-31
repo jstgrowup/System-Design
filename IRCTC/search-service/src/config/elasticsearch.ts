@@ -6,6 +6,9 @@ const esClient = new Client({ node: config.ELASTICSEARCH_URL });
 
 const STATION_INDEX = "stations";
 const TRAIN_INDEX = "trains";
+// Not live indices — initIndices() never creates them. Routes and schedules
+// are stored as nested fields on TRAIN_INDEX documents instead; these names
+// are kept only for callers that need the string, not an index to query.
 const ROUTE_INDEX = "routes";
 const SCHEDULE_INDEX = "schedules";
 

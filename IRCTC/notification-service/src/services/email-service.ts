@@ -37,6 +37,9 @@ class EmailService {
     this.maxRetries = 3;
   }
 
+  // This retry loop is independent of the Kafka-level withDLQ retry in
+  // email-consumer.ts — a message can be retried here (up to maxRetries)
+  // and then, if it still throws, retried again from the top by withDLQ.
   private async sendWithRetry(
     msg: EmailMessage,
     retries = 0,

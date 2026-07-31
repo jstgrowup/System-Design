@@ -46,7 +46,7 @@ interface Config {
 const config: Config = {
   // Server configuration
   PORT: process.env.PORT || 4000,
-  LOG_LEVEL: "4",  // Winston log levels: 0=debug, 1=info, 2=warn, 3=error, 4=silent
+  LOG_LEVEL: "4",  // NOTE: hardcoded, ignores process.env.LOG_LEVEL — see logger.ts for the resulting behavior
   SERVICE_NAME: packageJson.name,
   NODE_ENV: process.env.NODE_ENV || "development",
 

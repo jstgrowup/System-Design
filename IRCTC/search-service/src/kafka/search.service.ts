@@ -1,4 +1,7 @@
 import { consumer, producer, connectProducer } from "../config/kafka";
+// This file and services/search.service.ts share the basename "search.service.ts"
+// by design, not by accident — this one is the Kafka consumer/dispatcher,
+// the other is the Elasticsearch read/write logic it dispatches into.
 import searchService from "../services/search.service";
 import logger from "../config/logger";
 import { KAFKA_TOPICS } from "../../../shared/constants/kafka-topics";

@@ -4,6 +4,8 @@ import emailConsumer from "../kafka/email-consumer";
 /**
  * Entry point for the Notification Service.
  * Validates required env vars, then starts the Kafka email consumer.
+ * Despite the filename, this service has no database — it doesn't connect
+ * to Mongo or use the `mongoose` import above.
  */
 export async function startNotificationService(): Promise<void> {
   try {

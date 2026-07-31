@@ -1,5 +1,5 @@
 import prisma from "../config/prisma";
-import { ConflictError } from "../utils/error";
+import { ConflictError, NotFoundError } from "../utils/error";
 import logger from "../config/logger";
 import { StationBodyType } from "../types/zod";
 import adminProducer from "../kafka/producer/admin.producer";
@@ -42,4 +42,17 @@ const createStation = async ({ code, name, city, state }: StationBodyType) => {
   return createdStation;
 };
 
-export const stationService = { createStation };
+/**
+ * Looks up a station by id — used by the internal-only lookup route so
+ * other services (currently booking-service, to attach a station's name to
+ * a booking-confirmed email) can resolve a station without a JWT.
+ */
+const getStationById = async (id: string) => {
+  const station = await prisma.station.findUnique({ where: { id } });
+  if (!station) {
+    throw new NotFoundError("Station not found");
+  }
+  return station;
+};
+
+export const stationService = { createStation, getStationById };

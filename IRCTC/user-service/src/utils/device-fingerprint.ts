@@ -5,6 +5,10 @@ import { Request } from "express";
  * Generates a short device fingerprint from request headers.
  * Combines user-agent, IP address, and accept headers into a
  * SHA-256 hash, returning the first 16 characters as a device ID.
+ *
+ * Not a stable device identifier — it changes whenever the client's IP
+ * changes (new wifi/network, mobile carrier handoff, VPN toggle), which
+ * invalidates the refresh-token session keyed to it and forces a fresh login.
  */
 const getDeviceFingerprint = (req: Request): string => {
   const userAgent = req.headers["user-agent"] ?? "";

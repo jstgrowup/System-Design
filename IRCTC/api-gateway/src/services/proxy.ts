@@ -81,6 +81,8 @@ class CircuitBreaker {
   }
 
   private onFailure(): void {
+    // Not reset when entering HALF_OPEN, so a single failed test request
+    // re-trips the breaker immediately (count is already >= threshold).
     this.failureCount++;
     if (this.failureCount >= this.threshold) {
       this.state = "OPEN";
@@ -263,6 +265,9 @@ function createProxy(serviceName: string, serviceUrl: string) {
 
       // Remove 'users' (first part), keep the rest
       // ['users', 'auth', 'login'] -> ['auth', 'login'] -> '/auth/login'
+      // Only ever strips exactly one segment — can't reproduce a multi-segment
+      // prefix (e.g. user-service mounts under /api/v1), which is why some
+      // proxied routes 404 downstream despite matching here.
       const servicePath = "/" + pathParts.slice(1).join("/");
       logger.info(servicePath);
 

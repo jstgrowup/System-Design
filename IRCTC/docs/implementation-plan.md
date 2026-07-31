@@ -11,9 +11,10 @@ status), see [`api-contract.md`](./api-contract.md) in this same folder. This do
 is the narrative map; that one is the reference table.
 
 Per-service deep dives with pasted-in code also exist at `<service>/docs/README.md`
-for admin-service, api-gateway, notification-service, and search-service (not
-user-service — see below). Those are more detailed than this file for their one
-service; this file is the only place that covers all five plus how they connect.
+for admin-service, api-gateway, notification-service, search-service,
+inventory-service, booking-service, and payment-service (not user-service — see
+below). Those are more detailed than this file for their one service; this file is
+the only place that covers all seven plus how they connect.
 
 ---
 
@@ -23,17 +24,18 @@ IRCTC-backend is a train-ticket-booking backend split into independent services 
 talk to each other over Kafka, sitting behind a single API gateway. The intended
 shape is: users sign up and log in (user-service), admins create stations/trains/
 routes/schedules (admin-service), those changes get indexed into Elasticsearch for
-fast searching (search-service), and — not built yet — a booking flow would reserve
-seats (inventory-service), take payment (payment-service), and confirm a booking
-(booking-service), with notification-service emailing the user at each step.
+fast searching (search-service) and seeded into inventory-service's seat tracking,
+a booking flow reserves seats and orchestrates payment (booking-service, backed by
+inventory-service and payment-service), with notification-service emailing the
+user at each step.
 
-**Only three of those six conceptual services exist in this repo**: admin-service,
-user-service, and search-service, plus the always-present api-gateway and
-notification-service. `booking-service`, `payment-service`, and `inventory-service`
-are referenced by Kafka topic names, gateway config, and search-service's own event
-types, but **no such directories or code exist anywhere in this repo**. Any topic
-belonging to those (`inventory.seat-availability-updated`, `booking.*`,
-`payment.*`) is a placeholder for future work, not a wired-up integration.
+**All six conceptual services now exist in this repo**: admin-service,
+user-service, search-service, inventory-service, booking-service, and
+payment-service, plus the always-present api-gateway and notification-service.
+Every service typechecks; none has been verified against live infrastructure, and
+payment-service specifically has no real Razorpay merchant account to test its
+gateway calls against even if Postgres/Kafka were reachable — see its own
+per-service note in §5 and `docs/README.md`.
 
 ---
 
@@ -47,6 +49,8 @@ belonging to those (`inventory.seat-availability-updated`, `booking.*`,
 | **admin-service** | 4003 | Staff-facing station/train/route/schedule management, publishes domain events | ✅ Yes, `tsc --noEmit` passes clean | Code is complete and typechecks; **not verified live** (no reachable Postgres/Kafka in this sandbox). All 4 routes now mount, `createRoute`'s inverted check and `createStation`'s missing `await` are fixed, `ROUTE_CREATED` now publishes, and every route is behind `getUserContext` — see §5 and §6 |
 | **notification-service** | 4004 | Pure Kafka consumer — renders and sends transactional emails via Resend | ✅ Yes | Starts and runs correctly; only 2 of 5 email types it can send are ever actually triggered |
 | **inventory-service** | 4007 | Per-schedule seat inventory: tracks available/locked/booked counts and individual seat state, supports segment (partial-journey) locking, kept in sync via Kafka from admin-service's schedule events | ✅ Yes, `tsc --noEmit` passes clean | Code is complete and typechecks; **not verified live** — this sandbox has no reachable Postgres/Kafka, so `npm run dev` and an actual HTTP/Kafka round-trip haven't been exercised. Blocked from ever actually receiving events in practice because `admin.schedule-created` never fires (see Tier 2 below) and no gateway route reaches it (see api-gateway row) |
+| **booking-service** | 4005 | Orchestrates the booking saga (hold seats → create payment → confirm seats) across inventory-service and payment-service, with Redis distributed locking, CAS-based state transitions, and a background expiry job | ✅ Yes, `tsc --noEmit` passes clean | Ported from the `irctc-backend-main` reference (JS) into TypeScript. **Not verified live** (no reachable Postgres/Redis/Kafka in this sandbox); payment-service now exists (see next row), but with no real Razorpay account, so the saga still can't complete a real booking end-to-end — see §5 |
+| **payment-service** | 4006 | Razorpay gateway adapter (`BaseGateway`/`RazorpayGateway`/factory pattern): creates orders, captures via webhook or client-side verify, refunds, publishes `payment.success`/`payment.failed` | ✅ Yes, `tsc --noEmit` passes clean | Ported from the `irctc-backend-main` reference (JS) into TypeScript. **Not verified live** — no reachable Postgres/Kafka in this sandbox, and no real Razorpay credentials exist to exercise any gateway call against even if there were — see §5 |
 
 `admin-service` previously had no `.env.example` of its own and, per §7, once had
 a real (gitignored, uncommitted) `.env` that was byte-for-byte user-service's —
@@ -71,11 +75,8 @@ flowchart TB
         SS["Search Service :4002<br/>✅ builds + typechecks, not verified live<br/>Elasticsearch-backed search"]
         NS["Notification Service :4004<br/>pure Kafka consumer, sends email via Resend"]
         IS["Inventory Service :4007<br/>✅ builds + typechecks, not verified live<br/>seat inventory + segment locks, Postgres"]
-    end
-
-    subgraph NotBuilt["Referenced but not built in this repo"]
-        BS["booking-service"]
-        PS["payment-service"]
+        BS["Booking Service :4005<br/>✅ builds + typechecks, not verified live<br/>saga orchestration, Postgres+Redis"]
+        PS["Payment Service :4006<br/>✅ builds + typechecks, not verified live<br/>Razorpay gateway adapter, Postgres"]
     end
 
     subgraph Infra["Infrastructure (docker-compose)"]
@@ -91,8 +92,8 @@ flowchart TB
     GW -.->|"configured, no route wired up"| SS
     GW -.->|"configured, no route wired up"| NS
     GW -.->|"configured, no route wired up"| IS
-    GW -.->|"configured, no route wired up"| BS
-    GW -.->|"configured, no route wired up"| PS
+    GW -- "proxies (wired up, blocked by<br/>the same login-routing bug)" --> BS
+    GW -- "webhook route proxied,<br/>no real Razorpay account to test" --> PS
     IS --> PG
     KF -.->|"would populate schedule/seat rows,<br/>if anyone ever calls POST /schedules/schedule"| IS
 
@@ -104,7 +105,14 @@ flowchart TB
     KF --> SS
     SS --> ES
     KF --> NS
-    NS -.->|"booking.* — nothing ever publishes these"| KF
+    BS --> PG
+    BS --> RD
+    BS -- "holds/confirms seats via HTTP" --> IS
+    BS -- "HTTP — orders/verify/refunds,<br/>fails without real Razorpay creds" --> PS
+    BS -- "booking.confirmed/.cancelled/.failed<br/>✅ fire (carry an email field now)" --> KF
+    KF --> BS
+    PS --> PG
+    PS -- "payment.success/.failed<br/>✅ fire (webhook + client-verify paths)" --> KF
 ```
 
 ---
@@ -317,6 +325,96 @@ Postgres/Kafka** — no broker or database was reachable in the environment this
 built in, so the HTTP routes and Kafka consumer are untested beyond static
 type-checking.
 
+### booking-service
+The one service that talks to every other service for a single request. Owns
+`Booking` (+ `BookingSeat`, `Passenger` children), `SagaLog` (an audit trail of
+every saga step attempted, read back to know what to compensate on failure), and
+`IdempotencyRecord` (guards `POST /bookings` against duplicate submissions).
+
+It's a **saga orchestrator**: `POST /bookings` acquires a Redis distributed lock
+on the requested seats (all-or-nothing, via a Lua script), holds them in
+inventory-service, opens a payment order in payment-service, and returns payment
+details to the client. A Kafka consumer reacts to `payment.success`/`payment.failed`
+to confirm or release the held seats, and to `admin.schedule-cancelled` to cancel
+every active booking on a cancelled schedule. Every status transition goes through
+an optimistic-lock (CAS) helper keyed on the booking's own `version` column, so the
+payment webhook, a user's cancel request, and the background expiry job can never
+double-process the same booking even if they race — whichever one loses the CAS
+throws `StaleStateError` and bails out silently rather than corrupting state.
+
+Ported from `irctc-backend-main/booking-service` (a plain-JS reference
+implementation) into TypeScript, following this repo's stricter conventions: every
+request body validated with Zod (the reference validated manually), no `any`, and
+every downstream service's response shape typed locally in `types/index.ts` rather
+than imported across service boundaries. The saga logic itself — the three forward
+steps, the three compensations, the CAS pattern, the segment-lock key scheme — is
+an unmodified port of the reference's business logic.
+
+Two prerequisites were added elsewhere in this repo to support this service:
+admin-service gained a new `GET /stations/station/internal/:stationId` route
+(behind `internalAuth`, mirroring inventory-service's existing internal-route
+pattern) so booking-service's `stationClient` can resolve a station's name for
+segment-booking confirmation emails; and the API Gateway gained proxy routes for
+all five of booking-service's HTTP endpoints (see `api-gateway/src/routes/index.ts`).
+
+**Cannot complete a real booking end-to-end today** — payment-service now exists
+(see next section) and its saga path (`paymentClient.ts` → `POST /orders`) is
+structurally correct, but there's no real Razorpay merchant account behind
+payment-service, so `executeCreatePayment` fails with an auth error against the
+real Razorpay API rather than a connection error. Also still blocked:
+`admin.schedule-cancelled` never fires (admin-service has no cancel-schedule
+feature — see its own section above), so `handleScheduleCancelled` is
+unreachable in practice despite being fully implemented. **Not verified against
+a live Postgres, Redis, or Kafka** — no migration has even been generated yet for
+this service's Prisma schema, since no database was reachable while it was built;
+`npx tsc --noEmit` passing clean is the only verification performed.
+
+### payment-service
+The only service that talks to a real external system (Razorpay) rather than
+just other services in this repo. Owns `PaymentOrder` (one row per booking's
+payment attempt), `Refund` (one row per refund, full or partial), `PaymentAuditLog`
+(an append-only trail of every gateway interaction — order created, webhook
+received, signature verified, refund initiated — for reconstructing what actually
+happened independent of the current row's status), and `IdempotencyRecord`.
+
+Structured around an **adapter pattern**: `BaseGateway` is an abstract class
+defining six methods (`createOrder`, `verifyPaymentSignature`,
+`verifyWebhookSignature`, `fetchPayment`, `initiateRefund`, `fetchRefund`);
+`RazorpayGateway` is the only concrete implementation so far, chosen by
+`gateway.factory.ts`'s singleton based on `config.PAYMENT_GATEWAY`.
+`payment.service.ts` never imports the Razorpay SDK directly — only through this
+interface — so a second gateway (Stripe, etc.) could be added later without
+touching the business logic at all.
+
+A payment can be captured **two different ways that converge on the same state**:
+a public webhook (`POST /webhooks/razorpay`, called by Razorpay's own servers,
+signature-verified via HMAC) and a client-side verify call
+(`POST /orders/:id/verify`, called by booking-service right after checkout
+completes in the browser). Both check the `PaymentOrder`'s current status before
+acting, so whichever arrives first performs the capture and the second is a safe,
+idempotent no-op.
+
+Ported from `irctc-backend-main/payment-service` (a plain-JS reference
+implementation) into TypeScript, following this repo's stricter conventions: Zod
+validation on the three JSON routes (the reference validated manually), no `any`,
+and the gateway interface modeled as a TypeScript abstract class rather than a
+duck-typed object passed around at runtime. The adapter pattern itself, the
+idempotency scheme, the webhook event-type dispatch, and the refund
+running-total validation are an unmodified port of the reference's business logic.
+
+Every route except the public webhook is behind `internalAuth` — this service
+has no user-facing routes at all; booking-service is the only intended internal
+caller, and the client's browser talks to Razorpay's own checkout widget
+directly, never to this service.
+
+**Not verified against a live Postgres or Kafka, and has no real Razorpay
+credentials to test against even if it did** — there is no Razorpay merchant
+account behind this port, so every gateway call (`createOrder`,
+`verifyPaymentSignature` against a real signature, `initiateRefund`) fails with
+an auth error against the real Razorpay API. No Prisma migration has been
+generated yet either. `npx tsc --noEmit` passing clean is the only verification
+performed.
+
 ---
 
 ## 6. Why nothing currently works end-to-end
@@ -480,6 +578,7 @@ detail behind each line.
 - Exact request/response contract for every route and Kafka topic across all
   services: [`api-contract.md`](./api-contract.md).
 - Deep, code-pasted walkthroughs for admin-service, api-gateway,
-  notification-service, search-service, and inventory-service: `<service>/docs/README.md`.
+  notification-service, search-service, inventory-service, booking-service, and
+  payment-service: `<service>/docs/README.md`.
 - Root-level system map and cross-service flow diagrams: `/readme.md`.
 - Standing punch list: `/missing.md`.

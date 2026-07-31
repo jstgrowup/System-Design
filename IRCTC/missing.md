@@ -180,14 +180,26 @@ Service"`** — leftover from copying the file when the gateway was
 
 ## Not a bug, just not built yet
 
-- **Booking Service, Payment Service** don't exist in this repository at all —
-  only their names, ports, and Kafka topics are reserved for the future (in
-  `shared/constants/kafka-topics.ts` and `api-gateway`'s service-URL config).
+- **Payment Service now exists and typechecks** (ported from
+  `irctc-backend-main`'s reference JS implementation, adapter-pattern gateway
+  interface with Razorpay as the only concrete adapter) — isn't verified
+  against a real Postgres/Kafka, and there's no real Razorpay merchant account
+  to test any gateway call against even if there were. This is what still
+  blocks booking-service from ever completing a real booking end-to-end
+  today — the dependency is a real service now, not a missing one, but its
+  gateway calls fail with an auth error instead of a connection error. See
+  `payment-service/docs/README.md` and `docs/api-contract.md` §8.
+- **Booking Service now exists and typechecks** (ported from
+  `irctc-backend-main`'s reference JS implementation) — isn't verified against
+  a real Postgres/Redis/Kafka, and no Prisma migration has been generated yet.
+  Its saga can hold seats via inventory-service, but always fails at the
+  create-payment step since Payment Service has no real Razorpay credentials.
+  See `booking-service/docs/README.md` and `docs/api-contract.md` §7.
 - **Inventory Service now exists and typechecks**, but isn't verified against a
   real Postgres/Kafka, isn't proxied through the Gateway yet, and can't receive
   a real event even once running — admin-service's `POST /schedule` (the only
   trigger for `admin.schedule-created`) is still never mounted. See
   `inventory-service/docs/README.md` and `docs/api-contract.md` §6.
-- **User Service has no `docs/README.md` yet** — unlike the other four
+- **User Service has no `docs/README.md` yet** — unlike the other six
   services. `docs/auth.md` and the root `README.md` are the best references
   for it today.

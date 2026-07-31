@@ -170,6 +170,8 @@ export function getWelcomeTemplate(firstName: string): string {
   `;
 }
 
+// Currently unused — no consumer calls this; booking confirmations go through
+// getBookingConfirmedTemplate instead.
 export function getTicketConfirmationTemplate(ticketData: TicketData): string {
   const { pnr, trainName, trainNumber, from, to, date, passengers, amount } =
     ticketData;

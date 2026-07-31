@@ -181,8 +181,10 @@ const rotateRefreshToken = async ({
     throw new ForbiddenError("Session expired", "LOGIN_AGAIN");
   }
 
-  // If JTIs don't match, the token was already rotated — possible reuse attack
-  // Invalidate the session entirely as a security measure
+  // If JTIs don't match, the token was already rotated — possible reuse attack.
+  // We can't tell whether this caller or the one holding the current JTI is
+  // the attacker, so the whole device session is killed rather than just
+  // rejecting this call — the legitimate device is forced to log in again too.
   if (storedJti !== jti) {
     await redis.del(`refresh:${userId}:${deviceId}`);
     throw new ForbiddenError("Refresh token reused", "LOGIN_AGAIN");
