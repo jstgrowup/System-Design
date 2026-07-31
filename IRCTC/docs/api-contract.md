@@ -77,29 +77,29 @@ forwardedUrl = `${serviceBaseUrl}${servicePath}${queryString}`
   `http://localhost:4003/trains/train`
 - **Why broken**: admin-service mounts `POST /trains/train` only; this route is `GET`.
 
-### `POST /api/bookings/bookings` — ⚠️ WIRED, but blocked by the login bug
+### `POST /api/bookings/bookings` — ✅ WIRED (login's fix unblocked this)
 - Middleware: `requireAuth` → `endpointRateLimit(5, 60_000)` (5/min) → proxy
 - Rewrite: `/bookings/bookings` → strips `bookings` → forwards to
   `http://localhost:4005/bookings` — **matches** booking-service's own
-  `POST /bookings` mount exactly (unlike the login/admin routes above, this
-  path-rewrite is correct).
-- **Why still not reachable end-to-end**: `requireAuth` needs a valid JWT, and the
-  only way to get one is `POST /api/users/auth/login` — which is the Tier-1 bug
-  above. Once that's fixed, this route works as configured. Booking-service itself
-  also can't complete a booking yet regardless — payment-service now exists, but
+  `POST /bookings` mount exactly (unlike the old login-route bug, this
+  path-rewrite was always correct).
+- **Why this is now reachable in principle**: `requireAuth` needs a valid JWT,
+  and `POST /api/users/auth/login` (see §1 above) now actually issues one, so
+  this route is no longer blocked on the auth side. Booking-service itself
+  still can't complete a real booking regardless — payment-service exists, but
   there's no real Razorpay merchant account to test its gateway calls against —
   see booking-service's and payment-service's own docs.
 
-### `GET /api/bookings/bookings` — ⚠️ WIRED, same caveat as above
+### `GET /api/bookings/bookings` — ✅ WIRED, same as above
 - Middleware: `requireAuth` → `combinedRateLimit()` → proxy → `/bookings` on booking-service.
 
-### `GET /api/bookings/bookings/:bookingId` — ⚠️ WIRED, same caveat as above
+### `GET /api/bookings/bookings/:bookingId` — ✅ WIRED, same as above
 - Rewrite → `/bookings/:bookingId` on booking-service — matches.
 
-### `POST /api/bookings/bookings/:bookingId/verify-payment` — ⚠️ WIRED, same caveat as above
+### `POST /api/bookings/bookings/:bookingId/verify-payment` — ✅ WIRED, same as above
 - Rewrite → `/bookings/:bookingId/verify-payment` on booking-service — matches.
 
-### `POST /api/bookings/bookings/:bookingId/cancel` — ⚠️ WIRED, same caveat as above
+### `POST /api/bookings/bookings/:bookingId/cancel` — ✅ WIRED, same as above
 - Rewrite → `/bookings/:bookingId/cancel` on booking-service — matches.
 
 ### `POST /api/payments/webhooks/razorpay` — ✅ WIRED (public, no auth)
@@ -109,11 +109,11 @@ forwardedUrl = `${serviceBaseUrl}${servicePath}${queryString}`
   `http://localhost:4006/webhooks/razorpay` — **matches** payment-service's own
   mount exactly, including the raw `Buffer` body the gateway now forwards
   through to payment-service's signature check unmodified.
-- **Why this is genuinely reachable in principle, unlike the booking routes
-  above**: this route needs no JWT at all (Razorpay calls it directly, and
-  payment-service verifies its own webhook signature) — it isn't blocked by the
-  login-routing bug. The only reason it can't be exercised for real is that
-  there's no live Razorpay account configured to actually send a webhook.
+- This route never needed a JWT at all (Razorpay calls it directly, and
+  payment-service verifies its own webhook signature), so it was never blocked
+  by the login-route bug in the first place. The only reason it can't be
+  exercised for real is that there's no live Razorpay account configured to
+  actually send a webhook.
 
 ### `GET /api/gateway/health` — ✅ WORKING
 - No middleware, no proxy — self-contained.

@@ -90,7 +90,7 @@ on exactly where and why in section 6.
 
 | Service                                    | Port               | What it's _for_, in plain words                                                                                                                                                                        | Right now                                                                                           |
 | ------------------------------------------ | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
-| **API Gateway**                            | 4000               | The receptionist. Every request from the outside world is supposed to knock here first — it checks your login token, makes sure you're not spamming the server, and forwards you to the right service. | ✅ Runs, but only 2 routes are wired up, and both are currently broken (see §6)                     |
+| **API Gateway**                            | 4000               | The receptionist. Every request from the outside world is supposed to knock here first — it checks your login token, makes sure you're not spamming the server, and forwards you to the right service. | ✅ Runs; login now works through it, profile still 404s (see §6)                     |
 | **User Service**                           | 4001               | Handles "who are you." Signup (with an email OTP), login, issuing/renewing the tokens that prove you're logged in, and profile editing.                                                                | ✅ The auth part works well and is thoroughly tested/documented. Profile editing is now built too (was unbuilt/unmounted) — not verified live. |
 | **Admin Service**                          | 4003               | The back office. Where railway staff would add new stations, trains, the route a train follows, and which dates it runs.                                                                               | ✅ Code complete, typechecks. ⚠️ Not verified live (no reachable DB/Kafka in this environment)      |
 | **Search Service**                         | 4002               | The "find a train" feature, backed by Elasticsearch instead of the regular database, for fast searching.                                                                                               | ✅ Code complete, typechecks. ⚠️ Not verified live (no reachable Elasticsearch/Kafka in this environment) |
@@ -126,9 +126,15 @@ A short glossary for anything above (or below) that might be unfamiliar:
 ## 4. How Signup & Login Actually Work Today
 
 This is the **one flow in the entire repository that is fully built, wired
-up, and works end-to-end** — but only when you call the User Service
-**directly** (`http://localhost:4001/...`), not through the Gateway. (Why not
-through the Gateway is explained in §6.)
+up, and works end-to-end**. The login step specifically is now also reachable
+*through the Gateway* (`POST /api/users/auth/login`) — user-service used to
+mount login at a versioned `/api/v1/auth/login`, which the Gateway's rewrite
+rule could never reach; it's mounted at plain `/auth/login` now, matching
+every other service. The other three steps below (send-otp, verify-otp,
+refresh) still have no Gateway route defined at all, so they — and, for now,
+the safest way to exercise this whole flow — still mean calling User Service
+**directly** (`http://localhost:4001/...`). More on what else is still broken
+through the Gateway in §6.
 
 ```mermaid
 sequenceDiagram
@@ -139,7 +145,7 @@ sequenceDiagram
     participant K as Kafka
     participant N as Notification Service
 
-    C->>U: POST /api/v1/auth/send-otp<br/>{firstName, email, password}
+    C->>U: POST /auth/send-otp<br/>{firstName, email, password}
     U->>P: Is this email already registered?
     P-->>U: No
     U->>U: Hash the password (never store it plain)
@@ -149,19 +155,19 @@ sequenceDiagram
     N->>N: Build the email, send via Resend
     U-->>C: 200 OK + a cookie identifying this signup attempt
 
-    C->>U: POST /api/v1/auth/verify-otp<br/>{otp}
+    C->>U: POST /auth/verify-otp<br/>{otp}
     U->>R: Does this OTP match?
     R-->>U: Yes
     U->>P: Create the permanent user row
     U-->>C: 201 Created — account exists now
 
-    C->>U: POST /api/v1/auth/login<br/>{email, password}
+    C->>U: POST /auth/login<br/>{email, password}
     U->>P: Check the password
     U->>R: Save a login session,<br/>tied to this specific device
     U-->>C: 200 OK + accessToken (15 min)<br/>+ refreshToken (7 days) cookies
 
     Note over C,U: 15 minutes later, the accessToken expires...
-    C->>U: POST /api/v1/auth/refresh<br/>(cookies sent automatically)
+    C->>U: POST /auth/refresh<br/>(cookies sent automatically)
     U->>R: Is this the newest refresh token<br/>we issued for this device?
     R-->>U: Yes
     U-->>C: New accessToken + refreshToken<br/>(old one is now invalid)
@@ -241,32 +247,42 @@ as something actually observed working end-to-end.
 
 ## 6. What Happens When You Go Through the Gateway Today
 
-The Gateway is supposed to be the only door into the system. Right now, it
-only has two routes wired up at all — and **both of them are broken**, for
-two different, unrelated reasons:
+The Gateway is supposed to be the only door into the system. Its route table
+has grown across several passes (login/profile, two admin routes, booking's
+five routes, the payment webhook) — this section covers the two routes that
+were the original, longest-standing blocker; see `docs/api-contract.md` §1
+for the full, current route-by-route status of everything the Gateway proxies
+today.
 
 ```mermaid
 flowchart TD
     A["Client calls<br/>POST /api/users/auth/login<br/>through the Gateway"] --> B["Gateway rewrites the path<br/>and forwards to<br/>user-service:4001/auth/login"]
     B --> C{"Does that path exist<br/>on the User Service?"}
-    C -->|"No — the real route lives at<br/>/api/v1/auth/login, not /auth/login"| D["❌ 404 Not Found"]
+    C -->|"Yes — user-service now mounts<br/>login at plain /auth/login,<br/>not the old /api/v1/auth/login"| D["✅ 200 OK"]
 
     E["Client calls<br/>GET /api/users/user/profile<br/>through the Gateway"] --> F["Gateway forwards to<br/>user-service:4001/user/profile"]
-    F --> G{"Is the profile route file<br/>even mounted in the User<br/>Service's server.ts?"}
-    G -->|"No — it's written, but never<br/>imported/registered anywhere"| H["❌ 404 Not Found"]
+    F --> G{"Does User Service define<br/>a GET handler at /profile?"}
+    G -->|"No — only POST/PUT/DELETE<br/>/profile are defined, a<br/>method mismatch"| H["❌ 404 Not Found"]
 ```
 
-In other words: **as this repo stands, nothing reachable through the Gateway
-currently works.** The only way to exercise the working login flow described
-in §4 is to call the User Service directly on port 4001, bypassing the
-Gateway entirely. This isn't a deliberate design choice — it's a gap between
-how the Gateway assumes services are laid out and how they're actually laid
-out today.
+**Login is fixed** — user-service used to mount it at a versioned
+`/api/v1/auth/login`, which the Gateway's "strip one path segment, forward
+the rest" rewrite rule could never reproduce. It's mounted at plain
+`/auth/login` now (no version prefix), matching every other service in this
+repo, so the rewrite lands correctly. **Not verified live** — no reachable
+user-service/Postgres/Redis in the environment this was fixed in, so this is
+confirmed by re-reading the rewrite logic against the new mount path, not an
+observed request.
+
+**Profile is still broken**, for an unrelated reason: it's a `GET` route at
+the Gateway, but user-service's profile router only ever defines
+`POST`/`PUT`/`DELETE /profile` — there's no `GET` handler to match, regardless
+of mounting. This is a separate, not-yet-fixed gateway-side/method-mismatch
+bug.
 
 The Gateway's other safety features (rate limiting, the circuit breaker)
-still work correctly in isolation — they just don't currently have any
-working request to protect, since nothing gets past the routing mismatch
-above.
+work correctly in isolation, and can now actually protect a real request —
+the login route — for the first time.
 
 ---
 
@@ -397,13 +413,13 @@ still genuinely unbuilt: `notification.welcome-email` has no caller, and
 
 | Service                       | Starts up?                  | Fully reachable end-to-end?                            | Biggest reason why not                                         |
 | ----------------------------- | --------------------------- | ------------------------------------------------------ | -------------------------------------------------------------- |
-| API Gateway                   | ✅ Yes                      | ⚠️ Only 2 routes exist, and both 404                   | Path mismatch on login; a GET/POST method mismatch on the profile route (now mounted on the User Service side, but the Gateway still can't reach it correctly) |
-| User Service                  | ✅ Yes                      | ✅ Yes — _if called directly, not through the Gateway_ | The Gateway forwards to the wrong path                         |
+| API Gateway                   | ✅ Yes                      | ⚠️ Login now works through the Gateway; profile still 404s | Profile route is a GET/POST method mismatch (mounted on the User Service side, but the Gateway still can't reach it correctly) |
+| User Service                  | ✅ Yes                      | ✅ Yes — login now works both directly _and_ through the Gateway | Profile still needs to be called directly (Gateway's GET/profile method mismatch) |
 | Admin Service                 | ⚠️ Not verified live (code complete, typechecks) | ❌ | Not proxied through the Gateway correctly yet (method mismatch); no cancel-schedule feature exists either |
 | Search Service                | ⚠️ Not verified live (code complete, typechecks) | ❌ | Not proxied through the Gateway yet; nothing has actually published an event to it live either |
 | Notification Service          | ✅ Yes                      | ✅ Yes, as a background worker (no web routes to test) | —                                                              |
 | Inventory Service             | ⚠️ Not verified live (code complete, typechecks) | ❌ | Not proxied through the Gateway yet, and its one real trigger (Admin Service's schedule creation) hasn't been exercised live either |
-| Booking Service               | ⚠️ Not verified live (code complete, typechecks) | ❌ | Proxied through the Gateway now, but blocked by the same login-routing bug; its saga will still fail at the payment step without real Razorpay credentials behind Payment Service |
+| Booking Service               | ⚠️ Not verified live (code complete, typechecks) | ❌ | Proxied through the Gateway and reachable now that login works (a real JWT can be minted); its saga will still fail at the payment step without real Razorpay credentials behind Payment Service |
 | Payment Service               | ⚠️ Not verified live (code complete, typechecks) | ❌ | Its webhook route is proxied through the Gateway now, but there's no real Razorpay merchant account to exercise a gateway call against |
 
 None of the above are being fixed as part of this document — this is a
@@ -449,18 +465,18 @@ for exactly which variables it reads.
 Service directly:
 
 ```bash
-curl -X POST http://localhost:4001/api/v1/auth/send-otp \
+curl -X POST http://localhost:4001/auth/send-otp \
   -H "Content-Type: application/json" \
   -d '{"firstName":"Alice","email":"alice@example.com","password":"SecurePass1"}'
 
 # check the email inbox tied to your RESEND_API_KEY / MAIL_SEND for the OTP,
 # then:
-curl -X POST http://localhost:4001/api/v1/auth/verify-otp \
+curl -X POST http://localhost:4001/auth/verify-otp \
   -H "Content-Type: application/json" \
   --cookie "otp_session=<value from the Set-Cookie header above>" \
   -d '{"otp":"123456"}'
 
-curl -X POST http://localhost:4001/api/v1/auth/login \
+curl -X POST http://localhost:4001/auth/login \
   -H "Content-Type: application/json" \
   -d '{"email":"alice@example.com","password":"SecurePass1"}'
 ```

@@ -43,7 +43,7 @@ per-service note in §5 and `docs/README.md`.
 
 | Service | Port | Purpose | Builds? | Runtime status |
 |---|---|---|---|---|
-| **api-gateway** | 4000 | Single entry point; JWT auth, rate limiting, circuit breakers, reverse-proxies to downstream services | ✅ Yes | Starts fine, but **every one of its 4 proxied routes is broken** (see §6) |
+| **api-gateway** | 4000 | Single entry point; JWT auth, rate limiting, circuit breakers, reverse-proxies to downstream services | ✅ Yes | Starts fine; login now works end-to-end through it, but most other proxied routes are still broken or unverified (see §6) |
 | **user-service** | 4001 | Signup (email+OTP), login, refresh-token rotation, user profile | ✅ Yes, `tsc --noEmit` passes clean | Auth routes still work as before; profile routes are now mounted (`updateProfile`/`deleteProfile` implemented, previously empty stubs that hung every request), `verifyOtp` no longer leaks the password hash, the welcome email is now sent, and a new internal-only user-lookup route exists for other services — see §5 and §6 |
 | **search-service** | 4002 | Elasticsearch-backed train/station search, kept in sync via Kafka | ✅ Yes, `tsc --noEmit` passes clean | Code is complete and typechecks; **not verified live** (no reachable Elasticsearch/Kafka in this sandbox). The wrong-import build failure documented here previously was already stale by the time this was checked — the actual blockers were a bad controller import and three dead files referencing config fields that don't exist — see §5 and §6 |
 | **admin-service** | 4003 | Staff-facing station/train/route/schedule management, publishes domain events | ✅ Yes, `tsc --noEmit` passes clean | Code is complete and typechecks; **not verified live** (no reachable Postgres/Kafka in this sandbox). All 4 routes now mount, `createRoute`'s inverted check and `createStation`'s missing `await` are fixed, `ROUTE_CREATED` now publishes, and every route is behind `getUserContext` — see §5 and §6 |
@@ -87,12 +87,12 @@ flowchart TB
     end
 
     Client --> GW
-    GW -- "proxies (both broken today)" --> US
+    GW -- "proxies (login fixed;\nprofile still 404s)" --> US
     GW -- "proxies (broken: method mismatch)" --> AS
     GW -.->|"configured, no route wired up"| SS
     GW -.->|"configured, no route wired up"| NS
     GW -.->|"configured, no route wired up"| IS
-    GW -- "proxies (wired up, blocked by<br/>the same login-routing bug)" --> BS
+    GW -- "proxies (wired up; reachable now\nthat login can mint a real JWT)" --> BS
     GW -- "webhook route proxied,<br/>no real Razorpay account to test" --> PS
     IS --> PG
     KF -.->|"would populate schedule/seat rows,<br/>if anyone ever calls POST /schedules/schedule"| IS
@@ -435,18 +435,22 @@ detail behind each line.
   referencing config fields that don't exist. See §5.
 
 **Tier 2 — a service builds and starts, but its main entry points are broken:**
-- **Every gateway-proxied route is broken**, for three different reasons: (a)
-  `POST /api/users/auth/login` forwards to `/auth/login`, but user-service actually
-  mounts login at `/api/v1/auth/login` — the gateway's "strip one segment" rule
-  can't reproduce that prefix; (b) `GET /api/users/user/profile` forwards to
+- ~~`POST /api/users/auth/login` forwards to `/auth/login`, but user-service
+  mounted login at `/api/v1/auth/login`~~ **Fixed** — the gateway's "strip one
+  segment" rewrite rule is deliberately generic and uniform across every
+  proxied service, so rather than special-casing it for this one route,
+  user-service's `server.ts` now mounts auth routes at plain `/auth` (dropping
+  the version prefix), matching every other service in this repo. Login is
+  the first gateway-proxied route confirmed structurally correct end-to-end.
+  Two gateway-side issues remain: (b) `GET /api/users/user/profile` forwards to
   `/user/profile`, which now exists on user-service (`user.route.ts` is mounted at
-  `/user` as of this pass — see §5), but that file only defines `POST`/`PUT`/`DELETE
+  `/user` — see §5), but that file only defines `POST`/`PUT`/`DELETE
   /profile`, no `GET`, so the method mismatch remains; (c) the two admin routes
   (`GET /api/admins/stations/station`, `GET /api/admins/trains/train`) are
   registered as `GET` at the gateway but admin-service only defines `POST` for
   those paths — a method mismatch, still unfixed on the gateway side (admin-service
   itself now builds and runs, see §5, but the gateway can't reach it correctly yet).
-  All three are gateway-side fixes, not yet done.
+  Both remaining ones are gateway-side fixes, not yet done.
 - ~~user-service didn't typecheck~~ **Fixed** — `middlewares/user-context.middleware.ts`
   accesses `req.user`, but no `Express.Request` augmentation existed anywhere in the
   service to give `Request` a `user` field; added `types/express.d.ts`, matching the

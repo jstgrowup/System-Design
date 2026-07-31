@@ -34,12 +34,17 @@ not a changelog.
       first). `npx tsc --noEmit` now passes clean — **not verified live**.
       _File: `search-service/src/index.ts`_
 
-- [ ] **The Gateway's login route forwards to the wrong path.** It rewrites
-      `POST /api/users/auth/login` → `userService:4001/auth/login`, but
-      user-service actually mounts that route at `/api/v1/auth/login`. Every
-      login attempt through the Gateway 404s.
-      _Files: `api-gateway/src/routes/index.ts`, `api-gateway/src/services/proxy.ts`,
-      `user-service/src/server.ts`_
+- [x] **The Gateway's login route forwards to the wrong path.** Fixed —
+      user-service used to mount login at `/api/v1/auth/login`, which the
+      Gateway's rewrite (`POST /api/users/auth/login` → strips `users` →
+      forwards to `userService:4001/auth/login`) could never reach. Fixed on
+      the user-service side: `server.ts` now mounts auth routes at plain
+      `/auth` (no version prefix), matching every other service in this repo
+      and the reference implementation, rather than special-casing the
+      Gateway's otherwise-uniform one-segment-strip rewrite rule.
+      **Not verified live** — no reachable user-service/Postgres/Redis in the
+      environment this was fixed in.
+      _Files: `user-service/src/server.ts`_
 
 - [x] **User-service's profile routes were never mounted.** Fixed —
       `user.route.ts` is now mounted at `/user` in `server.ts`. The Gateway's
@@ -47,10 +52,13 @@ not a changelog.
       GET/POST method mismatch, a separate not-yet-done task).
       _File: `user-service/src/server.ts`_
 
-> **Net effect:** nothing reachable through the API Gateway currently works.
-> User Service, Admin Service, Search Service, and Inventory Service now all
-> build/typecheck, but none of them (except User Service's auth routes) has
-> been run against a live database, Elasticsearch, or broker.
+> **Net effect:** login is the first route reachable through the API Gateway
+> that actually works end-to-end at the code level. Every other proxied route
+> is still either broken (profile's method mismatch, admin's method
+> mismatches) or untested live. User Service, Admin Service, Search Service,
+> Inventory Service, Booking Service, and Payment Service now all
+> build/typecheck, but none of them has been run against a live database,
+> Elasticsearch, Redis, or broker.
 
 ---
 
