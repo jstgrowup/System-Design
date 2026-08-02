@@ -1,7 +1,7 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
-import { bookingApi } from '../api/booking.api';
+import { useState, useEffect, useRef, useCallback } from "react";
+import { bookingApi } from "../api/booking.api";
 
-const TERMINAL_STATUSES = ['CONFIRMED', 'CANCELLED', 'FAILED', 'EXPIRED'];
+const TERMINAL_STATUSES = ["CONFIRMED", "CANCELLED", "FAILED", "EXPIRED"];
 const POLL_INTERVAL = 3000;
 const MAX_POLLS = 20;
 

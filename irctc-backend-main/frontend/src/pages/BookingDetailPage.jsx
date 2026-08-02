@@ -1,14 +1,19 @@
-import { useState } from 'react';
-import { useParams } from 'react-router-dom';
-import { useBookingPolling } from '../hooks/useBookingPolling';
-import { bookingApi } from '../api/booking.api';
-import { useToast } from '../components/ui/Toast';
-import Badge from '../components/ui/Badge';
-import Button from '../components/ui/Button';
-import Modal from '../components/ui/Modal';
-import Spinner from '../components/ui/Spinner';
-import BookingStatusPoller from '../components/booking/BookingStatusPoller';
-import { formatDate, formatDateTime, formatCurrency, formatSeatType } from '../utils/format';
+import { useState } from "react";
+import { useParams } from "react-router-dom";
+import { useBookingPolling } from "../hooks/useBookingPolling";
+import { bookingApi } from "../api/booking.api";
+import { useToast } from "../components/ui/Toast";
+import Badge from "../components/ui/Badge";
+import Button from "../components/ui/Button";
+import Modal from "../components/ui/Modal";
+import Spinner from "../components/ui/Spinner";
+import BookingStatusPoller from "../components/booking/BookingStatusPoller";
+import {
+  formatDate,
+  formatDateTime,
+  formatCurrency,
+  formatSeatType,
+} from "../utils/format";
 
 export default function BookingDetailPage() {
   const { bookingId } = useParams();
@@ -21,18 +26,22 @@ export default function BookingDetailPage() {
     setCancelling(true);
     try {
       await bookingApi.cancel(bookingId);
-      showToast('Booking cancelled successfully', 'success');
+      showToast("Booking cancelled successfully", "success");
       setShowCancel(false);
       refresh();
     } catch (err) {
-      showToast(err.message || 'Failed to cancel', 'error');
+      showToast(err.message || "Failed to cancel", "error");
     } finally {
       setCancelling(false);
     }
   };
 
   if (loading) {
-    return <div className="flex justify-center py-20"><Spinner size="lg" /></div>;
+    return (
+      <div className="flex justify-center py-20">
+        <Spinner size="lg" />
+      </div>
+    );
   }
 
   if (error) {
@@ -48,7 +57,9 @@ export default function BookingDetailPage() {
 
   if (!booking) return null;
 
-  const canCancel = ['CONFIRMED', 'PAYMENT_PENDING', 'SEATS_HELD'].includes(booking.status);
+  const canCancel = ["CONFIRMED", "PAYMENT_PENDING", "SEATS_HELD"].includes(
+    booking.status,
+  );
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-8">
@@ -59,27 +70,36 @@ export default function BookingDetailPage() {
 
       <BookingStatusPoller status={booking.status} />
 
-      {booking.status === 'CONFIRMED' && (
+      {booking.status === "CONFIRMED" && (
         <div className="bg-green-50 border border-green-200 rounded-lg p-4 flex items-center gap-3 mb-6">
           <span className="text-2xl">✓</span>
           <div>
             <p className="font-semibold text-green-800">Booking Confirmed!</p>
-            <p className="text-sm text-green-700">Your tickets have been booked successfully</p>
+            <p className="text-sm text-green-700">
+              Your tickets have been booked successfully
+            </p>
           </div>
         </div>
       )}
 
-      {booking.status === 'FAILED' && (
+      {booking.status === "FAILED" && (
         <div className="bg-red-50 border border-red-200 rounded-lg p-4 mb-6">
           <p className="font-semibold text-red-800">Booking Failed</p>
-          {booking.failureReason && <p className="text-sm text-red-600 mt-1">{booking.failureReason}</p>}
+          {booking.failureReason && (
+            <p className="text-sm text-red-600 mt-1">{booking.failureReason}</p>
+          )}
         </div>
       )}
 
       {/* Train Info */}
       <div className="card mb-4">
-        <h3 className="text-lg font-semibold text-primary-900 mb-1">{booking.trainName}</h3>
-        <p className="text-sm text-gray-500 mb-3">#{booking.trainNumber} &middot; Departure: {formatDate(booking.departureDate)}</p>
+        <h3 className="text-lg font-semibold text-primary-900 mb-1">
+          {booking.trainName}
+        </h3>
+        <p className="text-sm text-gray-500 mb-3">
+          #{booking.trainNumber} &middot; Departure:{" "}
+          {formatDate(booking.departureDate)}
+        </p>
 
         <div className="grid grid-cols-2 gap-4 text-sm">
           <div>
@@ -92,7 +112,9 @@ export default function BookingDetailPage() {
           </div>
           <div>
             <p className="text-gray-500">Total Amount</p>
-            <p className="font-bold text-primary-900">{formatCurrency(booking.totalAmount)}</p>
+            <p className="font-bold text-primary-900">
+              {formatCurrency(booking.totalAmount)}
+            </p>
           </div>
           <div>
             <p className="text-gray-500">Seats</p>
@@ -152,7 +174,11 @@ export default function BookingDetailPage() {
       )}
 
       {canCancel && (
-        <Button variant="danger" onClick={() => setShowCancel(true)} className="w-full">
+        <Button
+          variant="danger"
+          onClick={() => setShowCancel(true)}
+          className="w-full"
+        >
           Cancel Booking
         </Button>
       )}
@@ -166,8 +192,9 @@ export default function BookingDetailPage() {
         loading={cancelling}
         danger
       >
-        Are you sure you want to cancel this booking? This action cannot be undone.
-        {booking.status === 'CONFIRMED' && ' A refund will be initiated.'}
+        Are you sure you want to cancel this booking? This action cannot be
+        undone.
+        {booking.status === "CONFIRMED" && " A refund will be initiated."}
       </Modal>
     </div>
   );

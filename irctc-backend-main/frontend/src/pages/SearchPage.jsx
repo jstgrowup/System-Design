@@ -1,7 +1,7 @@
-import SearchForm from '../components/search/SearchForm';
-import TrainList from '../components/search/TrainList';
-import Spinner from '../components/ui/Spinner';
-import { useSearchStore } from '../store/search.store';
+import SearchForm from "../components/search/SearchForm";
+import TrainList from "../components/search/TrainList";
+import Spinner from "../components/ui/Spinner";
+import { useSearchStore } from "../store/search.store";
 
 export default function SearchPage() {
   const { results, isSearching } = useSearchStore();
@@ -22,10 +22,11 @@ export default function SearchPage() {
         <div>
           <div className="flex items-center justify-between mb-4">
             <p className="text-sm text-gray-500">
-              {results.count || results.trains?.length || 0} train{(results.count || results.trains?.length) !== 1 ? 's' : ''} found
+              {results.count || results.trains?.length || 0} train
+              {(results.count || results.trains?.length) !== 1 ? "s" : ""} found
               {results.from?.resolved && ` from ${results.from.resolved}`}
               {results.to?.resolved && ` to ${results.to.resolved}`}
-              {results.date && results.date !== 'any' && ` on ${results.date}`}
+              {results.date && results.date !== "any" && ` on ${results.date}`}
             </p>
           </div>
           <TrainList trains={results.trains} />

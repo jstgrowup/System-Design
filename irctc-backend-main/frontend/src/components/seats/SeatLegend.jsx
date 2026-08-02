@@ -1,8 +1,8 @@
 const items = [
-  { label: 'Available', color: 'bg-green-100 border-green-400' },
-  { label: 'Selected', color: 'bg-blue-500 border-blue-600' },
-  { label: 'Locked', color: 'bg-yellow-100 border-yellow-400' },
-  { label: 'Booked', color: 'bg-red-100 border-red-300' },
+  { label: "Available", color: "bg-green-100 border-green-400" },
+  { label: "Selected", color: "bg-blue-500 border-blue-600" },
+  { label: "Locked", color: "bg-yellow-100 border-yellow-400" },
+  { label: "Booked", color: "bg-red-100 border-red-300" },
 ];
 
 export default function SeatLegend() {

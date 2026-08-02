@@ -1,11 +1,22 @@
-import { useEffect } from 'react';
-import Button from './Button';
+import { useEffect } from "react";
+import Button from "./Button";
 
-export default function Modal({ open, onClose, title, children, confirmText = 'Confirm', onConfirm, loading, danger }) {
+export default function Modal({
+  open,
+  onClose,
+  title,
+  children,
+  confirmText = "Confirm",
+  onConfirm,
+  loading,
+  danger,
+}) {
   useEffect(() => {
-    if (open) document.body.style.overflow = 'hidden';
-    else document.body.style.overflow = '';
-    return () => { document.body.style.overflow = ''; };
+    if (open) document.body.style.overflow = "hidden";
+    else document.body.style.overflow = "";
+    return () => {
+      document.body.style.overflow = "";
+    };
   }, [open]);
 
   if (!open) return null;
@@ -17,9 +28,15 @@ export default function Modal({ open, onClose, title, children, confirmText = 'C
         {title && <h3 className="text-lg font-semibold mb-3">{title}</h3>}
         <div className="text-sm text-gray-600 mb-6">{children}</div>
         <div className="flex justify-end gap-3">
-          <Button variant="secondary" onClick={onClose}>Cancel</Button>
+          <Button variant="secondary" onClick={onClose}>
+            Cancel
+          </Button>
           {onConfirm && (
-            <Button variant={danger ? 'danger' : 'primary'} onClick={onConfirm} loading={loading}>
+            <Button
+              variant={danger ? "danger" : "primary"}
+              onClick={onConfirm}
+              loading={loading}
+            >
               {confirmText}
             </Button>
           )}

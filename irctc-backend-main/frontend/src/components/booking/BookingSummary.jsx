@@ -1,6 +1,11 @@
-import { formatCurrency, formatSeatType, formatDate } from '../../utils/format';
+import { formatCurrency, formatSeatType, formatDate } from "../../utils/format";
 
-export default function BookingSummary({ train, seats, totalPrice, departureDate }) {
+export default function BookingSummary({
+  train,
+  seats,
+  totalPrice,
+  departureDate,
+}) {
   return (
     <div className="card mb-6">
       <h3 className="text-lg font-semibold mb-3">Booking Summary</h3>
@@ -10,7 +15,9 @@ export default function BookingSummary({ train, seats, totalPrice, departureDate
           <p className="text-sm text-gray-500">#{train?.trainNumber}</p>
         </div>
         {departureDate && (
-          <p className="text-sm text-gray-600">Departure: <strong>{formatDate(departureDate)}</strong></p>
+          <p className="text-sm text-gray-600">
+            Departure: <strong>{formatDate(departureDate)}</strong>
+          </p>
         )}
       </div>
 
@@ -33,8 +40,12 @@ export default function BookingSummary({ train, seats, totalPrice, departureDate
         </tbody>
         <tfoot>
           <tr>
-            <td colSpan={2} className="py-3 text-right font-bold">Total</td>
-            <td className="py-3 text-right font-bold text-primary-900 text-lg">{formatCurrency(totalPrice)}</td>
+            <td colSpan={2} className="py-3 text-right font-bold">
+              Total
+            </td>
+            <td className="py-3 text-right font-bold text-primary-900 text-lg">
+              {formatCurrency(totalPrice)}
+            </td>
           </tr>
         </tfoot>
       </table>

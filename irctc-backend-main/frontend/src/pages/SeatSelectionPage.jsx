@@ -1,15 +1,15 @@
-import { useState, useEffect } from 'react';
-import { useParams, useNavigate } from 'react-router-dom';
-import { inventoryApi } from '../api/inventory.api';
-import { useBookingStore } from '../store/booking.store';
-import { useToast } from '../components/ui/Toast';
-import AvailabilitySummary from '../components/seats/AvailabilitySummary';
-import SeatFilters from '../components/seats/SeatFilters';
-import SeatGrid from '../components/seats/SeatGrid';
-import SeatLegend from '../components/seats/SeatLegend';
-import SelectionSummary from '../components/seats/SelectionSummary';
-import Spinner from '../components/ui/Spinner';
-import { MAX_SEATS_PER_BOOKING } from '../utils/constants';
+import { useState, useEffect } from "react";
+import { useParams, useNavigate } from "react-router-dom";
+import { inventoryApi } from "../api/inventory.api";
+import { useBookingStore } from "../store/booking.store";
+import { useToast } from "../components/ui/Toast";
+import AvailabilitySummary from "../components/seats/AvailabilitySummary";
+import SeatFilters from "../components/seats/SeatFilters";
+import SeatGrid from "../components/seats/SeatGrid";
+import SeatLegend from "../components/seats/SeatLegend";
+import SelectionSummary from "../components/seats/SelectionSummary";
+import Spinner from "../components/ui/Spinner";
+import { MAX_SEATS_PER_BOOKING } from "../utils/constants";
 
 export default function SeatSelectionPage() {
   const { scheduleId } = useParams();
@@ -19,8 +19,8 @@ export default function SeatSelectionPage() {
   const selectedSeats = useBookingStore((s) => s.selectedSeats);
   const toggleSeat = useBookingStore((s) => s.toggleSeat);
   const setSelectedTrain = useBookingStore((s) => s.setSelectedTrain);
-  const fromStation = useBookingStore((s) => s.fromStation);  // --- SEGMENT BOOKING
-  const toStation = useBookingStore((s) => s.toStation);      // --- SEGMENT BOOKING
+  const fromStation = useBookingStore((s) => s.fromStation); // --- SEGMENT BOOKING
+  const toStation = useBookingStore((s) => s.toStation); // --- SEGMENT BOOKING
 
   const [availability, setAvailability] = useState(null);
   const [seats, setSeats] = useState([]);
@@ -43,13 +43,23 @@ export default function SeatSelectionPage() {
           inventoryApi.getSeats(scheduleId, seatParams),
         ]);
         const rawAvail = availRes.data || availRes;
-        const seatList = (seatsRes.data?.seats || seatsRes.seats || []).sort((a, b) => a.seatNumber - b.seatNumber);
+        const seatList = (seatsRes.data?.seats || seatsRes.seats || []).sort(
+          (a, b) => a.seatNumber - b.seatNumber,
+        );
         setSeats(seatList);
 
         // --- SEGMENT BOOKING: Recompute availability counts from segment-aware seat data ---
-        if (seatParams.fromSeq && seatParams.toSeq && seatList.some(s => s.segmentStatus)) {
-          const segAvail = seatList.filter(s => s.segmentStatus === 'AVAILABLE').length;
-          const segUnavail = seatList.filter(s => s.segmentStatus === 'UNAVAILABLE').length;
+        if (
+          seatParams.fromSeq &&
+          seatParams.toSeq &&
+          seatList.some((s) => s.segmentStatus)
+        ) {
+          const segAvail = seatList.filter(
+            (s) => s.segmentStatus === "AVAILABLE",
+          ).length;
+          const segUnavail = seatList.filter(
+            (s) => s.segmentStatus === "UNAVAILABLE",
+          ).length;
           setAvailability({
             ...rawAvail,
             available: segAvail,
@@ -63,15 +73,18 @@ export default function SeatSelectionPage() {
         // If no selectedTrain in store, set from availability data
         if (!selectedTrain) {
           const avail = availRes.data || availRes;
-          setSelectedTrain({
-            trainName: avail.trainName,
-            trainNumber: avail.trainNumber,
-            trainId: avail.trainId,
-          }, scheduleId);
+          setSelectedTrain(
+            {
+              trainName: avail.trainName,
+              trainNumber: avail.trainNumber,
+              trainId: avail.trainId,
+            },
+            scheduleId,
+          );
         }
       } catch (err) {
-        showToast(err.message || 'Failed to load seats', 'error');
-        navigate('/search');
+        showToast(err.message || "Failed to load seats", "error");
+        navigate("/search");
       } finally {
         setLoading(false);
       }
@@ -82,11 +95,16 @@ export default function SeatSelectionPage() {
   const handleToggleSeat = (seat) => {
     const result = toggleSeat(seat);
     if (result === false) {
-      showToast(`Maximum ${MAX_SEATS_PER_BOOKING} seats can be selected`, 'warning');
+      showToast(
+        `Maximum ${MAX_SEATS_PER_BOOKING} seats can be selected`,
+        "warning",
+      );
     }
   };
 
-  const filteredSeats = filter ? seats.filter((s) => s.seatType === filter) : seats;
+  const filteredSeats = filter
+    ? seats.filter((s) => s.seatType === filter)
+    : seats;
 
   if (loading) {
     return (
@@ -107,7 +125,11 @@ export default function SeatSelectionPage() {
         </div>
 
         <SeatFilters activeFilter={filter} onChange={setFilter} />
-        <SeatGrid seats={filteredSeats} selectedSeats={selectedSeats} onToggleSeat={handleToggleSeat} />
+        <SeatGrid
+          seats={filteredSeats}
+          selectedSeats={selectedSeats}
+          onToggleSeat={handleToggleSeat}
+        />
       </div>
 
       <SelectionSummary />

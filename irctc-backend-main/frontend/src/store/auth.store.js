@@ -1,5 +1,5 @@
-import { create } from 'zustand';
-import { authApi } from '../api/auth.api';
+import { create } from "zustand";
+import { authApi } from "../api/auth.api";
 
 export const useAuthStore = create((set, get) => ({
   user: null,
@@ -26,8 +26,8 @@ export const useAuthStore = create((set, get) => ({
 }));
 
 // Listen for forced logout from API interceptor
-if (typeof window !== 'undefined') {
-  window.addEventListener('auth:logout', () => {
+if (typeof window !== "undefined") {
+  window.addEventListener("auth:logout", () => {
     useAuthStore.getState().logout();
   });
 }

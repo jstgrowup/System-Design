@@ -1,9 +1,14 @@
-import TrainCard from './TrainCard';
-import EmptyState from '../ui/EmptyState';
+import TrainCard from "./TrainCard";
+import EmptyState from "../ui/EmptyState";
 
 export default function TrainList({ trains }) {
   if (!trains || trains.length === 0) {
-    return <EmptyState title="No trains found" message="Try different stations or date" />;
+    return (
+      <EmptyState
+        title="No trains found"
+        message="Try different stations or date"
+      />
+    );
   }
 
   return (

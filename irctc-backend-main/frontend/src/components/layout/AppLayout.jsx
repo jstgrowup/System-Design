@@ -1,7 +1,7 @@
-import { Outlet } from 'react-router-dom';
-import Navbar from './Navbar';
-import Footer from './Footer';
-import { ToastProvider } from '../ui/Toast';
+import { Outlet } from "react-router-dom";
+import Navbar from "./Navbar";
+import Footer from "./Footer";
+import { ToastProvider } from "../ui/Toast";
 
 export default function AppLayout() {
   return (

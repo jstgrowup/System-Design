@@ -1,4 +1,4 @@
-import SeatTile from './SeatTile';
+import SeatTile from "./SeatTile";
 
 export default function SeatGrid({ seats, selectedSeats, onToggleSeat }) {
   if (!seats || seats.length === 0) {

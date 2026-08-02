@@ -1,9 +1,9 @@
-import { create } from 'zustand';
+import { create } from "zustand";
 
 export const useSearchStore = create((set) => ({
-  from: '',
-  to: '',
-  date: '',
+  from: "",
+  to: "",
+  date: "",
   results: null,
   isSearching: false,
 

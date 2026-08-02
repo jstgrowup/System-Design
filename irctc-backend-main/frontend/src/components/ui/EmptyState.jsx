@@ -1,4 +1,8 @@
-export default function EmptyState({ title = 'No results found', message, children }) {
+export default function EmptyState({
+  title = "No results found",
+  message,
+  children,
+}) {
   return (
     <div className="text-center py-16">
       <div className="text-5xl mb-4 text-gray-300">📭</div>

@@ -1,15 +1,15 @@
-import { Routes, Route } from 'react-router-dom';
-import AppLayout from '../components/layout/AppLayout';
-import ProtectedRoute from './ProtectedRoute';
-import HomePage from '../pages/HomePage';
-import LoginPage from '../pages/LoginPage';
-import SearchPage from '../pages/SearchPage';
-import SeatSelectionPage from '../pages/SeatSelectionPage';
-import BookingPage from '../pages/BookingPage';
-import BookingDetailPage from '../pages/BookingDetailPage';
-import MyBookingsPage from '../pages/MyBookingsPage';
-import AdminPage from '../pages/AdminPage';
-import NotFoundPage from '../pages/NotFoundPage';
+import { Routes, Route } from "react-router-dom";
+import AppLayout from "../components/layout/AppLayout";
+import ProtectedRoute from "./ProtectedRoute";
+import HomePage from "../pages/HomePage";
+import LoginPage from "../pages/LoginPage";
+import SearchPage from "../pages/SearchPage";
+import SeatSelectionPage from "../pages/SeatSelectionPage";
+import BookingPage from "../pages/BookingPage";
+import BookingDetailPage from "../pages/BookingDetailPage";
+import MyBookingsPage from "../pages/MyBookingsPage";
+import AdminPage from "../pages/AdminPage";
+import NotFoundPage from "../pages/NotFoundPage";
 
 export default function AppRouter() {
   return (

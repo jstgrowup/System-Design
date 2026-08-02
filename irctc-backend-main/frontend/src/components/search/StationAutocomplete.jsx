@@ -1,9 +1,14 @@
-import { useState, useEffect, useRef } from 'react';
-import { useDebounce } from '../../hooks/useDebounce';
-import { searchApi } from '../../api/search.api';
+import { useState, useEffect, useRef } from "react";
+import { useDebounce } from "../../hooks/useDebounce";
+import { searchApi } from "../../api/search.api";
 
-export default function StationAutocomplete({ label, value, onChange, placeholder }) {
-  const [query, setQuery] = useState(value || '');
+export default function StationAutocomplete({
+  label,
+  value,
+  onChange,
+  placeholder,
+}) {
+  const [query, setQuery] = useState(value || "");
   const [suggestions, setSuggestions] = useState([]);
   const [open, setOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -17,25 +22,32 @@ export default function StationAutocomplete({ label, value, onChange, placeholde
     }
     let cancelled = false;
     setLoading(true);
-    searchApi.autocomplete(debouncedQuery).then((res) => {
-      if (!cancelled) {
-        setSuggestions(res.data || []);
-        setOpen(true);
-      }
-    }).catch(() => {
-      if (!cancelled) setSuggestions([]);
-    }).finally(() => {
-      if (!cancelled) setLoading(false);
-    });
-    return () => { cancelled = true; };
+    searchApi
+      .autocomplete(debouncedQuery)
+      .then((res) => {
+        if (!cancelled) {
+          setSuggestions(res.data || []);
+          setOpen(true);
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setSuggestions([]);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [debouncedQuery]);
 
   useEffect(() => {
     function handleClickOutside(e) {
-      if (wrapperRef.current && !wrapperRef.current.contains(e.target)) setOpen(false);
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target))
+        setOpen(false);
     }
-    document.addEventListener('mousedown', handleClickOutside);
-    return () => document.removeEventListener('mousedown', handleClickOutside);
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
   // Sync external value changes
@@ -51,13 +63,17 @@ export default function StationAutocomplete({ label, value, onChange, placeholde
 
   return (
     <div className="relative" ref={wrapperRef}>
-      {label && <label className="block text-sm font-medium text-gray-700 mb-1">{label}</label>}
+      {label && (
+        <label className="block text-sm font-medium text-gray-700 mb-1">
+          {label}
+        </label>
+      )}
       <input
         type="text"
         value={query}
         onChange={(e) => {
           setQuery(e.target.value);
-          if (e.target.value.length < 2) onChange('', '');
+          if (e.target.value.length < 2) onChange("", "");
         }}
         onFocus={() => suggestions.length > 0 && setOpen(true)}
         placeholder={placeholder}

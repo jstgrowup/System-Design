@@ -1,4 +1,4 @@
-const TABS = ['Stations', 'Trains', 'Routes', 'Schedules'];
+const TABS = ["Stations", "Trains", "Routes", "Schedules"];
 
 export default function AdminTabs({ active, onChange }) {
   return (
@@ -9,8 +9,8 @@ export default function AdminTabs({ active, onChange }) {
           onClick={() => onChange(tab)}
           className={`px-5 py-3 text-sm font-semibold whitespace-nowrap border-b-2 transition-colors ${
             active === tab
-              ? 'border-primary-900 text-primary-900'
-              : 'border-transparent text-gray-400 hover:text-gray-600'
+              ? "border-primary-900 text-primary-900"
+              : "border-transparent text-gray-400 hover:text-gray-600"
           }`}
         >
           {tab}
