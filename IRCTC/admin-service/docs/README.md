@@ -316,6 +316,9 @@ This is new behavior: `getUserContext` is now mounted on every route in this ser
 import dotenv from "dotenv";
 dotenv.config();
 
+// Must stay above the imports below — config/index.ts reads process.env at
+// module-load time, and CommonJS require() (this project's module target)
+// runs each import in file order, so dotenv.config() executes first.
 import app from "./server";
 import { config } from "./config";
 import logger from "./config/logger";
@@ -350,7 +353,7 @@ void startServer();
 
 This is a substantially fuller entry point than before. Two things changed in this pass:
 
-1. `dotenv.config()` now runs on line 2, before `import app from "./server"` and every other import that transitively pulls in `config/index.ts`. Since `config/index.ts` builds its `Config` object by reading `process.env.*` at module-load time, this ordering matters: any variable set only in `.env` (not already in the shell environment) is now guaranteed to be populated by the time `config` is built. Before this fix, `dotenv.config()` ran *after* the `import { config } from "./config"` line — too late to affect anything, since ES module imports are hoisted and evaluated before the rest of the file's own statements run.
+1. `dotenv.config()` now runs on line 2, before `import app from "./server"` and every other import that transitively pulls in `config/index.ts`. Since `config/index.ts` builds its `Config` object by reading `process.env.*` at module-load time, this ordering matters: any variable set only in `.env` (not already in the shell environment) is now guaranteed to be populated by the time `config` is built. The file itself now carries a comment explaining why this ordering matters: this project's `tsconfig.json` sets `"module": "CommonJS"`, so each `import` compiles down to a `require()` call executed in file order (unlike ES modules, whose imports are hoisted) — meaning `dotenv.config()` genuinely must appear textually before the imports that depend on it, not just conceptually. Before this fix, `dotenv.config()` ran *after* the `import { config } from "./config"` line — too late, since by then `config/index.ts` had already been required and had already read `process.env.*`.
 2. The dead `import connectDB from "./config/db"` — a leftover Mongoose-style import pointing at a file that never existed in this project, and that was never called anywhere even when it "existed" in intent — has been removed. Prisma's own `config/prisma.ts` already owns the database connection; there was never a `connectDB` to call.
 
 The rest — `startServer`, graceful shutdown on `SIGTERM`/`SIGINT` that closes the HTTP server and disconnects the Kafka producer before exiting — was already structured this way and is unchanged by this pass.
@@ -596,8 +599,6 @@ const createStation = asyncHandler(
     });
   },
 );
-
-export const stationController = { createStation };
 ```
 
 Two bugs are fixed here: `stationService.createStation(...)` is now `await`ed (so a rejection — e.g. `ConflictError` on a duplicate code — correctly propagates to `asyncHandler`'s `.catch(next)` and on to `errorHandler`, instead of becoming an unhandled promise rejection while the client gets a false 200), and the response message is now `"Station created successfully"` instead of a leftover `"OTP sent successfully"` from a different (OTP-based) flow. See [Lifecycle Case D](#case-d-post-stationsstation-with-a-code-that-already-exists-conflict--the-missing-await-bug-is-fixed) for the corrected flow.
@@ -1214,8 +1215,8 @@ INTERNAL_SERVICE_KEY=   # read into config.INTERNAL_SERVICE_KEY, but nothing und
 |---|---|---|
 | `BadRequestError` | 400 | `train.controller.ts` (empty seats/stations — unreachable in practice), `train.service.ts` (duplicate seat numbers; invalid station ids; non-contiguous sequence numbers), and `schedule.service.ts` (no seats, no route, bad date) |
 | `UnauthorizedError` | 401 | `user-context.middleware.ts` — now mounted on every route in this service (station, train, schedule), so this fires for real whenever `x-user-id` is missing. Before this pass it was defined but never mounted, so it never fired |
-| `ForbiddenError` | 403 | — (defined, not thrown anywhere) |
-| `NotFoundError` | 404 | `train.service.ts` — `getTrainById` (train doesn't exist) and `createRoute` (train doesn't exist). The previous *incorrect* use of `NotFoundError` for "route already exists" is gone — that path now throws `ConflictError` instead (see Known Issues history) |
+| `ForbiddenError` | 403 | `internal-auth.middleware.ts` — thrown when `x-internal-service-key` is missing or doesn't match `config.INTERNAL_SERVICE_KEY`, guarding `GET /stations/station/internal/:stationId`. This is new this pass — before `internalAuth` existed, nothing threw `ForbiddenError` anywhere |
+| `NotFoundError` | 404 | `train.service.ts` — `getTrainById` (train doesn't exist) and `createRoute` (train doesn't exist); and `station.service.ts` — `getStationById` (station doesn't exist), new this pass for the internal lookup route. The previous *incorrect* use of `NotFoundError` for "route already exists" is gone — that path now throws `ConflictError` instead (see Known Issues history) |
 | `ConflictError` | 409 | `station.service.ts` (duplicate code), `train.service.ts` (duplicate train number, and now also route already exists for this train), and `schedule.service.ts` (train not found — a copy-pasted use of `ConflictError` for a not-found case; duplicate schedule for the same date) |
 | `TooManyRequestsError` | 429 | — (defined, not thrown anywhere — no rate limiting in this service) |
 | `InternalServerError` | 500 | — (defined, not thrown — `error.middleware.ts` builds its own 500 response inline instead, same pattern as the API Gateway) |

@@ -348,7 +348,7 @@ This service has no Kafka **consumer** at all — it never subscribes to anythin
 | `GET /health` | none | Checks Postgres (`SELECT 1`); `503` if unreachable. |
 | `GET /` | none | Static "Hello from payment-service" string. |
 
-All five non-webhook routes are now proxied through the API Gateway too — `POST /api/payments/webhooks/razorpay` (public) and, via booking-service, the internal ones indirectly. See `api-gateway/src/routes/index.ts`; the raw-body middleware branch for this exact path already existed in the gateway's `index.ts` before this service did, written ahead of time for exactly this route.
+Only the webhook route is actually registered in the API Gateway — `POST /payments/webhooks/razorpay` (see `api-gateway/src/routes/index.ts`), exposed publicly as `POST /api/payments/webhooks/razorpay`; the raw-body middleware branch for this exact path already existed in the gateway's `index.ts` before this service did, written ahead of time for exactly this route. The four internal routes are **not** proxied through the API Gateway at all — booking-service calls payment-service directly at `config.PAYMENT_SERVICE_URL` (see `booking-service/src/services/paymentClient.ts`), bypassing the gateway entirely, the same way it reaches every other internal service.
 
 ---
 

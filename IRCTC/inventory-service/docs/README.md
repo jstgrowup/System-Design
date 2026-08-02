@@ -48,7 +48,7 @@ It is not a public-facing service — every route either requires the caller to 
 ┌───────────────────────────────────────────────────────────────────────┐
 │                            ADMIN SERVICE                              │
 │   scheduleController.createSchedule → adminProducer                   │
-│   publishes admin.schedule-created / admin.schedule-cancelled         │
+│   publishes admin.schedule-created (schedule-cancelled has no caller) │
 └─────────────────────────────┬───────────────────────────────────────--┘
                               │ Kafka (localhost:9093)
                               ▼
@@ -94,9 +94,10 @@ It is not a public-facing service — every route either requires the caller to 
       └──────────────────┘                    └──────────────────────┘
 ```
 
-Two important gaps in this diagram, both verified while writing this doc (see [Known Issues](#known-issues--inconsistencies) for detail):
+Two things worth checking on your own before trusting this diagram at face value (see [Known Issues](#known-issues--inconsistencies) for detail):
 
-- **`admin.schedule-created` never actually fires today.** admin-service defines `POST /schedule` (`admin-service/src/routes/schedule.route.ts`) but its `server.ts` only mounts `stationRoutes` and `trainRoutes` — the schedule route is never `app.use()`'d. So even a fully working, fully deployed inventory-service would sit there with an empty database, because nothing ever calls `scheduleController.createSchedule` to publish the event this service's consumer is waiting for.
+- **`admin.schedule-created` now actually fires — this used to be broken, but no longer is.** admin-service's `server.ts` mounts `scheduleRoutes` at `/schedules` (`app.use("/schedules", scheduleRoutes)`), so `POST /schedules/schedule` reaches `scheduleController.createSchedule`, which calls `scheduleService.createSchedule` → `adminProducer.publishScheduleCreated`. Calling that endpoint directly against admin-service (there's still no gateway route for it, see below) does publish a real `admin.schedule-created` event that this service's consumer picks up and processes.
+- **`admin.schedule-cancelled` still never fires, but for a different reason.** `adminProducer.publishScheduleCancelled` is fully implemented and would work if called, but nothing in admin-service ever calls it — there's no schedule-cancellation route/controller/service built yet (admin-service's own producer file has a comment saying as much). So this service's `cancelScheduleInventory` handler remains unreachable in practice today.
 - **The API Gateway doesn't proxy to this service.** `api-gateway/src/routes/index.ts` has no route mentioning inventory at all — an external client (or even booking-service, if it were forced to go through the gateway) has no path into this service except by calling `http://localhost:4007` directly.
 
 ---
@@ -165,9 +166,13 @@ shared/
 
 ## Lifecycle Walkthroughs
 
-### Case A: A schedule is created (happy path, assuming the event actually arrives)
+### Case A: A schedule is created (happy path)
 
 ```
+0.  Prerequisite: something calls admin-service's POST /schedules/schedule
+    directly (there's no API Gateway route for it, so this has to be a
+    curl/Postman/script call straight to admin-service, not a normal user
+    action) — this route is mounted and does now publish the event below.
 1.  admin-service publishes a fully denormalized payload (train info + every
     seat + the full route) to "admin.schedule-created"
 2.  inventoryConsumer's eachMessage (wrapped by withDLQ) parses the JSON and
@@ -446,6 +451,10 @@ enum SeatStatus {
   CANCELLED
 }
 
+// One row per (trainId, departureDate) schedule fanned out from
+// admin-service's admin.schedule-created event. Aggregate seat counters
+// (available/locked/booked) are recomputed from SeatInventory rather than
+// trusted as a running total, to avoid counter drift under concurrent writes.
 model ScheduleInventory {
   id            String   @id @default(uuid())
   scheduleId    String   @unique
@@ -470,6 +479,10 @@ model ScheduleInventory {
   @@map("schedule_inventories")
 }
 
+// One row per physical seat per schedule. `status` is the seat's summary
+// status across the whole journey; segment-level (partial-journey) locks
+// live in SeatSegmentLock instead and get reconciled into this row's status
+// by recomputeSegmentSeatStatuses.
 model SeatInventory {
   id                  String     @id @default(uuid())
   scheduleInventoryId String
@@ -497,6 +510,9 @@ model SeatInventory {
   @@map("seat_inventories")
 }
 
+// Ordered station list per schedule, populated from the same
+// SCHEDULE_CREATED event's denormalized route. Used to resolve a station ID
+// to its sequence number for segment-overlap checks (see SeatSegmentLock).
 model RouteStop {
   id             String @id @default(uuid())
   scheduleId     String
@@ -511,6 +527,10 @@ model RouteStop {
   @@map("route_stops")
 }
 
+// One row per seat locked/booked for a specific journey segment
+// [fromSeq, toSeq). Two segments overlap when a.fromSeq < b.toSeq AND
+// b.fromSeq < a.toSeq — this is what lets two passengers hold the same
+// physical seat for non-overlapping parts of a train's route.
 model SeatSegmentLock {
   id            String     @id @default(uuid())
   scheduleId    String
@@ -533,6 +553,8 @@ model SeatSegmentLock {
   @@map("seat_segment_locks")
 }
 
+// Guards Kafka consumer handlers (initializeInventory, cancelScheduleInventory)
+// against reprocessing the same event twice on redelivery.
 model IdempotencyRecord {
   id          String   @id @default(uuid())
   eventKey    String   @unique
@@ -1031,8 +1053,8 @@ Every variable in `.env.example` is actually read by `config/index.ts` — unlik
 
 | Topic | Direction | Handled by |
 |---|---|---|
-| `admin.schedule-created` | consumed | `initializeInventory` — creates `ScheduleInventory` + `SeatInventory` rows. **Never actually fires today** — admin-service's `POST /schedule` route is defined but not mounted in its `server.ts`, so nothing ever publishes this event under current system state. |
-| `admin.schedule-cancelled` | consumed | `cancelScheduleInventory` — marks the schedule and all its seats `CANCELLED`. Same caveat: unreachable while admin-service's schedule route stays unmounted. |
+| `admin.schedule-created` | consumed | `initializeInventory` — creates `ScheduleInventory` + `SeatInventory` rows. **Now actually fires** — admin-service's `server.ts` mounts `scheduleRoutes` at `/schedules`, so `POST /schedules/schedule` reaches `scheduleController.createSchedule`, which publishes this event via `adminProducer.publishScheduleCreated`. (Still no API Gateway route for it, so it's only reachable by calling admin-service directly.) |
+| `admin.schedule-cancelled` | consumed | `cancelScheduleInventory` — marks the schedule and all its seats `CANCELLED`. **Still never fires, for a different reason than schedule-created's old one** — `adminProducer.publishScheduleCancelled` exists and is wired correctly, but nothing in admin-service calls it; there's no schedule-cancellation route/controller/service built yet. |
 | `inventory.seat-availability-updated` | published | Emitted after every state change (init, cancel, lock, unlock, confirm, cancel-booking, expiry sweep). Intended for search-service to keep its index current — not verified as part of this documentation pass. |
 | `dlq.inventory-service` | published (rare) | Only reached if a `admin.schedule-created`/`admin.schedule-cancelled` message fails processing 3 times in a row (`withDLQ`, `DLQ_MAX_RETRIES = 3`). |
 
@@ -1075,10 +1097,14 @@ Postgres must be reachable at `DATABASE_URL`, and Kafka at `KAFKA_BROKER` (defau
 curl http://localhost:4007/health
 # { "success": true, "message": "Inventory Service is healthy", "database": true, "timestamp": "..." }
 
-# Since admin.schedule-created never actually fires today (see Known Issues),
-# there is currently no way to get a ScheduleInventory row into the database
-# except by inserting one directly or by calling admin-service's
-# scheduleController.createSchedule from a script/test rather than over HTTP.
+# admin.schedule-created now fires for real (see Known Issues) — call
+# admin-service's POST /schedules/schedule directly to get a
+# ScheduleInventory row created here via Kafka. There's no API Gateway
+# route for it yet, so this has to go straight to admin-service (default
+# port 4003), e.g.:
+#   curl -X POST http://localhost:4003/schedules/schedule \
+#     -H "Content-Type: application/json" -H "x-user-id: <uuid>" \
+#     -d '{"trainId":"<uuid>","departureDate":"2026-09-01"}'
 
 curl -X POST http://localhost:4007/seats/lock \
   -H "Content-Type: application/json" \
@@ -1090,7 +1116,7 @@ curl -X POST http://localhost:4007/seats/lock \
 
 ## Debugging Tips
 
-- **Database shows no schedules at all, even though admin-service is running** → this is expected today. `admin-service/src/server.ts` never mounts `schedule.route.ts`, so `admin.schedule-created` is never published — check that first before suspecting this service's Kafka consumer.
+- **Database shows no schedules at all, even though admin-service is running** → the route is mounted and does publish `admin.schedule-created` now, so first check whether anything has actually called `POST /schedules/schedule` on admin-service — there's no gateway route or UI that calls it automatically, so an idle system will still show an empty inventory database until something calls it directly (curl/Postman/script). Only suspect this service's Kafka consumer once you've confirmed the event was actually published.
 - **`403 Invalid or missing internal service key`** on `/seats/lock` etc. → the caller didn't send `x-internal-service-key`, or it doesn't exactly match `config.INTERNAL_SERVICE_KEY` — check both services' `.env` have the identical value.
 - **`401 User context missing - must come through gateway`** on `GET /schedules/:scheduleId/seats` → the request has neither a valid `x-internal-service-key` nor an `x-user-id` header. If you're calling this service directly (not through the gateway) for testing, you must set `x-user-id` yourself — there's no gateway in this path to set it for you (there's no gateway route for this service at all today, see Known Issues).
 - **A lock never seems to expire** → check the process logs for "Skipping lock expiry job — another instance is the leader" — if you're running multiple instances locally, only one of them will ever log the actual cleanup. Also check `LOCK_EXPIRY_INTERVAL_MS` and that `lockExpiresAt` on the seat row is actually in the past.
@@ -1106,10 +1132,10 @@ Observed while reviewing the code — documented here rather than fixed, since t
 
 1. **This service has not been run against a live Postgres or Kafka broker as part of this session.** Verification so far consisted of `npx tsc --noEmit` (passes clean) and `npx prisma generate` (schema compiles) — there has been no live boot, no HTTP round-trip, and no Kafka round-trip, because this environment has no reachable database or broker. Treat the request/response shapes and lifecycle walkthroughs above as "what the code says it does," not as "observed behavior."
 2. **Not reachable through the API Gateway.** `api-gateway/src/routes/index.ts` has no route mentioning inventory at all (confirmed by grep) — there is no proxy configured for this service today, even though `INVENTORY_SERVICE_URL` and an `inventoryService` circuit breaker already exist in the gateway's config (see the gateway's own docs). Wiring that up is a separate, not-yet-done task.
-3. **`admin.schedule-created` never actually fires under the current system state.** `admin-service/src/routes/schedule.route.ts` defines `POST /schedule`, but `admin-service/src/server.ts` only mounts `stationRoutes` and `trainRoutes` — the schedule route's own file even carries a comment acknowledging this ("Not mounted anywhere... there is currently no HTTP path that reaches scheduleController.createSchedule"). This means that even a fully running, fully deployed inventory-service would never receive a real `admin.schedule-created` event today; its database would stay empty. This is a bug in admin-service, not in this service.
+3. **`admin.schedule-created` now fires — this entry is corrected from a previous version of this doc, which said it never did.** `admin-service/src/server.ts` mounts `scheduleRoutes` at `/schedules` (`app.use("/schedules", scheduleRoutes)`), so `POST /schedules/schedule` reaches `scheduleController.createSchedule` → `scheduleService.createSchedule` → `adminProducer.publishScheduleCreated`. Calling that endpoint directly against admin-service (there is still no API Gateway route for it) does publish a real event that this service's consumer picks up and processes correctly. **`admin.schedule-cancelled` still never fires, though** — `adminProducer.publishScheduleCancelled` is implemented and would work if called, but nothing in admin-service ever calls it (its own file has a comment confirming there's no schedule-cancellation route/controller/service yet). So `cancelScheduleInventory` remains unreachable in practice, just not for the reason previously documented here.
 4. **`SuccessResponse` (in `utils/api-response.ts`) is defined but never called.** Every successful response is built inline in the controller (`res.status(200).json({ success: true, ... })`) instead of going through this helper — dead code today.
 5. **No startup validation of required env vars.** Unlike notification-service (which calls `process.exit(1)` if `RESEND_API_KEY`/`MAIL_SEND`/`KAFKA_BROKER` are missing) or the API Gateway (which throws if JWT secrets are missing), this service will start successfully even with `DATABASE_URL` or `INTERNAL_SERVICE_KEY` unset — it just fails the first time something actually needs them (every DB call; every internal-auth check, which then rejects all callers since `undefined !== ` any real header value sent).
-6. **Six dependencies in `package.json` are unrelated to what this service does and are never imported anywhere under `src/`**: `@langchain/cohere`, `@langchain/core`, `@langchain/groq`, `@langchain/openai`, `mongoose`, `bcrypt`, `jsonwebtoken`, `otp-generator`, `ioredis`, `http-status`, `resend`. This is the same pattern seen in api-gateway and notification-service's docs — `package.json` looks copied from a template (likely user-service) without pruning.
+6. **Eleven dependencies in `package.json` are unrelated to what this service does and are never imported anywhere under `src/`** (confirmed by grep): `@langchain/cohere`, `@langchain/core`, `@langchain/groq`, `@langchain/openai`, `mongoose`, `bcrypt`, `jsonwebtoken`, `otp-generator`, `ioredis`, `http-status`, `resend`. This is the same pattern seen in api-gateway and notification-service's docs — `package.json` looks copied from a template (likely user-service) without pruning.
 7. **`npm run seed` points at `src/services/seed.ts`**, which does not exist in this project (only `services/inventory.service.ts` exists) — running that script fails. Same issue flagged in both other services' docs, likely from the same shared `package.json` origin.
 8. **Two different import paths for the same Zod version.** `types/zod.ts` imports from `"zod"`, while `utils/zod.formatter.ts` imports `ZodError` from `"zod/v4"`. Since `package.json` pins `"zod": "^4.4.3"`, these currently resolve to the same code, but it's an inconsistent style within one small service — one file assumes it might be running under Zod v3 with the v4 compat import, the other assumes v4 is already the default export.
 9. **`ScheduleCancelledEventData`'s union-envelope handling is a workaround for an upstream inconsistency**, not a bug in this service: `cancelScheduleInventory` explicitly checks `"data" in eventData ? eventData.data : eventData` because admin-service's producer wraps the payload (`{ eventType, data, timestamp }`) while `admin.schedule-created`'s payload is not wrapped the same way. Worth knowing if a payload shape ever needs to change on the admin-service side.

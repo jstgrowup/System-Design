@@ -80,16 +80,15 @@ It does not implement business logic itself — every real operation (login, boo
                     └───────────────────────────┘
 ```
 
-This section (and the route-count claims elsewhere in this doc) predates several
-routes that exist in the code today — `src/routes/index.ts` also has two
-`GET /admins/*` routes (registered before this pass), five
-`POST`/`GET /bookings/bookings*` routes proxying to booking-service, and one
-`POST /payments/webhooks/razorpay` route proxying to payment-service (both added
-once those services existed — see their own docs). This doc's route-by-route
-walkthroughs below were not fully re-audited to match — treat the specific
-"only 2 routes" framing as outdated, and the
-[Known Issues](#known-issues--inconsistencies) section's route-count claim as
-similarly due for a refresh.
+`src/routes/index.ts` today defines 11 routes across four proxies:
+`userService` (login, profile), `adminService` (two `GET /admins/*` routes),
+`bookingService` (five `POST`/`GET /bookings/bookings*` routes), and
+`paymentService` (one `POST /payments/webhooks/razorpay` route for the
+Razorpay webhook), plus the gateway's own `/gateway/health`. `searchService`,
+`notificationService`, and `inventoryService` have circuit breakers
+pre-created in `services/proxy.ts` but no route proxies to them yet. See
+[routes/index.ts — Routing](#3-routesindexts--routing) below for the full
+table.
 
 ---
 
@@ -224,7 +223,7 @@ process.on("SIGINT", gracefulShutdown);
 process.on("unhandledRejection", (err) => { logger.error(err); server.close(() => process.exit(1)); });
 ```
 
-**Note on the Razorpay webhook route:** there's no `/api/payments/*` route actually registered in `routes/index.ts` today — this raw-body branch is dead code until a payments route is added, but it's harmless to leave in place.
+**Note on the Razorpay webhook route:** `routes/index.ts` now registers `POST /payments/webhooks/razorpay` (proxying to `paymentService`), so this raw-body branch is live — Razorpay's webhook calls hit exactly this path and need the raw bytes for signature verification. (Earlier revisions of this doc described this branch as dead code, back when no `/payments/*` route existed yet.)
 
 **Graceful shutdown** (`gracefulShutdown()`) calls `server.close()` and force-exits after 30 seconds if it hangs. It does **not** call `RedisClient.closeConnection()` — the Redis connection is left open until process exit rather than being closed explicitly.
 
@@ -232,30 +231,56 @@ process.on("unhandledRejection", (err) => { logger.error(err); server.close(() =
 
 ### 2. `config/` — Configuration, Redis, Logger
 
-**`config/index.ts`** loads everything from environment variables into one typed object, with defaults for everything except the two JWT secrets:
+**`config/index.ts`** loads environment variables into one typed object. Most fields have a fallback default; the notable exceptions are `JWT_ACCESS_SECRET` and `JWT_REFRESH_SECRET` (validated below — the app refuses to boot without them) and `REDIS_URL`, which has no fallback string at all — if unset, `undefined` is passed straight to `ioredis`, which happens to interpret that as "connect to `localhost:6379`" on its own. `LOG_LEVEL` isn't read from `process.env` at all — see [Known Issues](#known-issues--inconsistencies):
 
 ```typescript
 const config: Config = {
+  // Server configuration
   PORT: process.env.PORT || 4000,
+  LOG_LEVEL: "4",  // NOTE: hardcoded, ignores process.env.LOG_LEVEL — see logger.ts for the resulting behavior
+  SERVICE_NAME: packageJson.name,
   NODE_ENV: process.env.NODE_ENV || "development",
-  JWT_ACCESS_SECRET: process.env.JWT_ACCESS_SECRET as string,   // required, no default
-  JWT_REFRESH_SECRET: process.env.JWT_REFRESH_SECRET as string, // required, no default
-  RATE_LIMIT_WINDOW_MS: parseInt(process.env.RATE_LIMIT_WINDOW_MS || "900000", 10),  // 15 min
-  RATE_LIMIT_MAX_REQUESTS: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || "100", 10),
+
+  // Cache & storage
+  REDIS_URL: process.env.REDIS_URL,
+
+  // CORS security - comma-separated list of allowed origins
+  ALLOWED_ORIGINS: process.env.ALLOWED_ORIGINS || "http://localhost:3000",
+
+  // JWT Secrets (REQUIRED - no defaults!)
+  JWT_ACCESS_SECRET: process.env.JWT_ACCESS_SECRET as string,
+  JWT_REFRESH_SECRET: process.env.JWT_REFRESH_SECRET as string,
+  ACCESS_TOKEN_EXP: process.env.ACCESS_TOKEN_EXP,
+  REFRESH_TOKEN_EXP: process.env.REFRESH_TOKEN_EXP,
+
+  // Token expiry times in seconds
+  ACCESS_TOKEN_EXP_SEC: parseInt(process.env.ACCESS_TOKEN_EXP_SEC || "900", 10),        // 15 minutes
+  REFRESH_TOKEN_EXP_SEC: parseInt(process.env.REFRESH_TOKEN_EXP_SEC || "604800", 10),  // 7 days
+
+  // Rate Limiting Configuration
+  RATE_LIMIT_WINDOW_MS: parseInt(process.env.RATE_LIMIT_WINDOW_MS || "900000", 10),  // 15 minutes
+  RATE_LIMIT_MAX_REQUESTS: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS || "100", 10), // per IP/user
+
+  // Downstream Microservices URLs
   SERVICES: {
     USER_SERVICE_URL: process.env.USER_SERVICE_URL || "http://localhost:4001",
     // ...6 more service URLs, all with localhost defaults
   },
-  SERVICE_TIMEOUT_MS: parseInt(process.env.SERVICE_TIMEOUT_MS || "60000", 10),
-  CIRCUIT_BREAKER_THRESHOLD: parseInt(process.env.CIRCUIT_BREAKER_THRESHOLD || "5", 10),
-  CIRCUIT_BREAKER_TIMEOUT: parseInt(process.env.CIRCUIT_BREAKER_TIMEOUT || "60000", 10),
+
+  // Circuit Breaker Configuration
+  SERVICE_TIMEOUT_MS: parseInt(process.env.SERVICE_TIMEOUT_MS || "60000", 10),              // 60 seconds
+  CIRCUIT_BREAKER_THRESHOLD: parseInt(process.env.CIRCUIT_BREAKER_THRESHOLD || "5", 10),  // Open after 5 failures
+  CIRCUIT_BREAKER_TIMEOUT: parseInt(process.env.CIRCUIT_BREAKER_TIMEOUT || "60000", 10),  // Wait 60 seconds
 };
 
 // App refuses to start if either JWT secret is missing:
-["JWT_ACCESS_SECRET", "JWT_REFRESH_SECRET"].forEach((key) => {
+const requiredConfig: (keyof Config)[] = ["JWT_ACCESS_SECRET", "JWT_REFRESH_SECRET"];
+requiredConfig.forEach((key) => {
   if (!config[key]) throw new Error(`Missing required environment variable: ${key}`);
 });
 ```
+
+`ACCESS_TOKEN_EXP`, `REFRESH_TOKEN_EXP`, `ACCESS_TOKEN_EXP_SEC`, and `REFRESH_TOKEN_EXP_SEC` are loaded here but nothing else in `api-gateway/src` reads `config.ACCESS_TOKEN_EXP*` or `config.REFRESH_TOKEN_EXP*` — the gateway doesn't issue tokens itself (that's user-service's job) — see [Known Issues](#known-issues--inconsistencies).
 
 **`config/redis.ts`** is a singleton wrapper around `ioredis`:
 
@@ -297,20 +322,129 @@ const logger = winston.createLogger({
 ### 3. `routes/index.ts` — Routing
 
 ```typescript
-const userServiceProxy = createProxy("userService", config.SERVICES.USER_SERVICE_URL);
+const userServiceProxy = createProxy(
+  "userService",
+  config.SERVICES.USER_SERVICE_URL,
+);
 
-// Public — but rate limited to 10 requests / 15 min per IP+endpoint (brute-force guard)
-gatewayRouter.post("/users/auth/login", endpointRateLimit(10, 900000), userServiceProxy);
+// ROUTE 1: User Login (Unauthenticated)
+// POST /api/users/auth/login — no auth required (login creates the token)
+// Rate limited: 10 requests per 15 minutes per IP (prevents brute force)
+gatewayRouter.post(
+  "/users/auth/login",
+  endpointRateLimit(10, 900000), // 10 requests, 900000ms = 15 minutes
+  userServiceProxy,
+);
 
-// Authenticated — requireAuth runs first, then combined IP+user rate limiting
-gatewayRouter.get("/users/user/profile", requireAuth, combinedRateLimit(), userServiceProxy);
+// ROUTE 2: Get User Profile (Authenticated)
+// GET /api/users/user/profile — requires a valid JWT
+// Rate limited: Combined IP + user-based (IP: 100/15min, User: 1000/15min)
+gatewayRouter.get(
+  "/users/user/profile",
+  requireAuth,
+  combinedRateLimit(),
+  userServiceProxy,
+);
 
-// Gateway's own health check — answered directly, never proxied
-gatewayRouter.get("/gateway/health", (req, res) =>
-  res.status(200).json({ success: true, message: "Gateway is healthy", timestamp: new Date().toString() }));
+const adminServiceProxy = createProxy(
+  "adminService",
+  config.SERVICES.ADMIN_SERVICE_URL,
+);
+
+gatewayRouter.get(
+  "/admins/stations/station",
+  requireAuth,
+  combinedRateLimit(),
+  adminServiceProxy,
+);
+gatewayRouter.get(
+  "/admins/trains/train",
+  requireAuth,
+  combinedRateLimit(),
+  adminServiceProxy,
+);
+
+// BOOKING SERVICE ROUTES (authenticated)
+const bookingServiceProxy = createProxy(
+  "bookingService",
+  config.SERVICES.BOOKING_SERVICE_URL,
+);
+
+gatewayRouter.post(
+  "/bookings/bookings",
+  requireAuth,
+  endpointRateLimit(5, 60000), // 5 booking attempts per minute — booking creation is expensive/sensitive
+  bookingServiceProxy,
+);
+gatewayRouter.get(
+  "/bookings/bookings",
+  requireAuth,
+  combinedRateLimit(),
+  bookingServiceProxy,
+);
+gatewayRouter.get(
+  "/bookings/bookings/:bookingId",
+  requireAuth,
+  combinedRateLimit(),
+  bookingServiceProxy,
+);
+gatewayRouter.post(
+  "/bookings/bookings/:bookingId/verify-payment",
+  requireAuth,
+  combinedRateLimit(),
+  bookingServiceProxy,
+);
+gatewayRouter.post(
+  "/bookings/bookings/:bookingId/cancel",
+  requireAuth,
+  combinedRateLimit(),
+  bookingServiceProxy,
+);
+
+// PAYMENT SERVICE ROUTES
+const paymentServiceProxy = createProxy(
+  "paymentService",
+  config.SERVICES.PAYMENT_SERVICE_URL,
+);
+
+// Public — no auth. Razorpay calls this directly; payment-service verifies
+// the request itself via its own webhook signature, not a JWT. This also
+// activates the raw-body middleware branch in index.ts, which was written
+// for this exact path before payment-service existed.
+gatewayRouter.post("/payments/webhooks/razorpay", paymentServiceProxy);
+
+// ROUTE 3: Gateway Health Check
+// GET /api/gateway/health — returns gateway status (no proxying needed)
+gatewayRouter.get("/gateway/health", (req, res) => {
+  return res.status(200).json({
+    success: true,
+    message: "Gateway is healthy",
+    timestamp: new Date().toString(),
+  });
+});
 ```
 
-This is the entire route table today. Adding a new proxied route means: create a proxy with `createProxy(serviceName, serviceUrl)` (the `serviceName` must match a key already in `circuitBreakers` inside `services/proxy.ts`), then register a route with whatever combination of `requireAuth` / rate-limit middleware fits.
+This is the full route table today — 11 routes across four proxies, plus the gateway's own health check:
+
+| Method | Path | Middleware | Forwards to |
+|---|---|---|---|
+| POST | `/users/auth/login` | `endpointRateLimit(10, 15min)` | userService `/auth/login` |
+| GET | `/users/user/profile` | `requireAuth`, `combinedRateLimit()` | userService `/user/profile` |
+| GET | `/admins/stations/station` | `requireAuth`, `combinedRateLimit()` | adminService `/stations/station` |
+| GET | `/admins/trains/train` | `requireAuth`, `combinedRateLimit()` | adminService `/trains/train` |
+| POST | `/bookings/bookings` | `requireAuth`, `endpointRateLimit(5, 1min)` | bookingService `/bookings` |
+| GET | `/bookings/bookings` | `requireAuth`, `combinedRateLimit()` | bookingService `/bookings` |
+| GET | `/bookings/bookings/:bookingId` | `requireAuth`, `combinedRateLimit()` | bookingService `/bookings/:bookingId` |
+| POST | `/bookings/bookings/:bookingId/verify-payment` | `requireAuth`, `combinedRateLimit()` | bookingService `/bookings/:bookingId/verify-payment` |
+| POST | `/bookings/bookings/:bookingId/cancel` | `requireAuth`, `combinedRateLimit()` | bookingService `/bookings/:bookingId/cancel` |
+| POST | `/payments/webhooks/razorpay` | *(none — public)* | paymentService `/webhooks/razorpay` |
+| GET | `/gateway/health` | *(none)* | answered directly, never proxied |
+
+Cross-checked against each downstream service's own route files: user-service mounts `/auth` and `/user` directly (`user-service/src/server.ts`), admin-service mounts `/stations` and `/trains` (`admin-service/src/server.ts`), booking-service mounts its router at root (`booking-service/src/server.ts`), and payment-service's webhook router is mounted at root too (`payment-service/src/server.ts`) — so the gateway's one-segment path stripping (see [services/proxy.ts](#6-servicesproxyts--proxy--circuit-breaker) below) lines up correctly with all four proxied services today.
+
+`searchService`, `notificationService`, and `inventoryService` have circuit breakers pre-created in `services/proxy.ts` but no route here proxies to any of them yet.
+
+Adding a new proxied route means: create a proxy with `createProxy(serviceName, serviceUrl)` (the `serviceName` must match a key already in `circuitBreakers` inside `services/proxy.ts`), then register a route with whatever combination of `requireAuth` / rate-limit middleware fits.
 
 ---
 
@@ -406,7 +540,7 @@ const circuitBreakers = {
 };
 ```
 
-Only `userService`'s breaker is ever exercised today, since it's the only one with a route pointing at it.
+`userService`, `adminService`, `bookingService`, and `paymentService`'s breakers are all exercised today via the routes registered in `routes/index.ts`. `searchService`, `notificationService`, and `inventoryService` still have breakers pre-created here but no route ever points at them.
 
 State machine:
 
@@ -419,25 +553,59 @@ HALF_OPEN --(success)-->  CLOSED     |   HALF_OPEN --(failure)--> OPEN (timer re
 **Request forwarding + path rewrite:**
 
 ```typescript
-function createProxy(serviceName, serviceUrl) {
+function createProxy(serviceName: string, serviceUrl: string) {
   const circuitBreaker = circuitBreakers[serviceName];
-  return async (req, res, next) => {
+
+  if (!circuitBreaker) {
+    throw new Error(`No circuit breaker found for service: ${serviceName}`);
+  }
+
+  return async (
+    req: Request,
+    res: Response,
+    next: NextFunction,
+  ): Promise<void> => {
     try {
-      // /api/users/auth/login → req.path (relative to gatewayRouter) is /users/auth/login
-      const pathParts = req.path.split("/").filter(Boolean);   // ["users", "auth", "login"]
-      const servicePath = "/" + pathParts.slice(1).join("/");  // drop "users" → "/auth/login"
+      // Extract path (remove /api prefix only)
+      // Gateway: /api/users/auth/login -> Service: /auth/login
+      // Gateway: /api/users/user/profile -> Service: /user/profile
+      logger.info(req.path);
+      const pathParts = req.path.split("/").filter(Boolean);
+      logger.info(pathParts);
+
+      // Remove 'users' (first part), keep the rest
+      // ['users', 'auth', 'login'] -> ['auth', 'login'] -> '/auth/login'
+      // Only ever strips exactly one segment — can't reproduce a multi-segment
+      // prefix (e.g. user-service mounts under /api/v1), which is why some
+      // proxied routes 404 downstream despite matching here.
+      const servicePath = "/" + pathParts.slice(1).join("/");
+      logger.info(servicePath);
 
       const result = await forwardRequest(
         serviceUrl,
-        servicePath + (query string if present),
-        req.method, req.body, req.headers,
+        servicePath +
+          (req.url.includes("?")
+            ? req.url.substring(req.url.indexOf("?"))
+            : ""),
+        req.method,
+        req.body,
+        req.headers,
         circuitBreaker,
       );
 
-      // Copy response headers except connection/keep-alive/transfer-encoding/host
+      // Forward response headers (except some)
+      const excludeHeaders = [
+        "connection",
+        "keep-alive",
+        "transfer-encoding",
+        "host",
+      ];
       Object.keys(result.headers).forEach((key) => {
-        if (!excludeHeaders.includes(key.toLowerCase())) res.setHeader(key, result.headers[key]);
+        if (!excludeHeaders.includes(key.toLowerCase())) {
+          res.setHeader(key, result.headers[key] as string);
+        }
       });
+
       res.status(result.status).json(result.data);
     } catch (err) {
       next(err);
@@ -445,6 +613,10 @@ function createProxy(serviceName, serviceUrl) {
   };
 }
 ```
+
+The "can't reproduce a multi-segment prefix" comment in the code is itself a little stale: it was written when user-service was mounted under `/api/v1`, which — per [Known Issue #7](#known-issues--inconsistencies) below — is no longer the case. It's left as-is in the source; this doc isn't changing it, just flagging that the specific example it gives no longer applies, even though the one-segment-only limitation it describes is still real.
+
+Before forwarding, the incoming request headers are run through `normalizeHeaders()`, which drops `host` and `content-length` (both would be wrong for the downstream request) and flattens any multi-value header into a comma-joined string. For `GET`/`DELETE` requests, `req.body` (if present) is sent as axios `params` (i.e. a query string) rather than a request body; for every other method it's sent as `data`.
 
 `forwardRequest()` uses axios with `validateStatus: () => true` (so 4xx/5xx from the downstream service are returned as-is, not thrown), and maps connection-level failures to gateway-specific errors:
 
@@ -499,10 +671,17 @@ JWT_REFRESH_SECRET=<32+ char secret>
 
 ACCESS_TOKEN_EXP_SEC=900        # 15 min
 REFRESH_TOKEN_EXP_SEC=604800    # 7 days
+ACCESS_TOKEN_EXP=              # read into config, but nothing in this codebase reads it back out — see Known Issues
+REFRESH_TOKEN_EXP=             # same as above
 
 ALLOWED_ORIGINS=http://localhost:3000,http://localhost:3001
+# code default if unset is a single origin, "http://localhost:3000" (not a
+# comma list) — the two-origin example above is just illustrating the format
 
 REDIS_URL=redis://localhost:6379
+# note: config/index.ts has no fallback string for this one — if REDIS_URL is
+# unset, `undefined` is passed to ioredis directly, which happens to default
+# to localhost:6379 on its own
 
 RATE_LIMIT_WINDOW_MS=900000     # 15 min
 RATE_LIMIT_MAX_REQUESTS=100
@@ -584,14 +763,14 @@ curl http://localhost:4000/api/users/user/profile \
 Observed while reviewing the code — documented here rather than fixed, since these are informational:
 
 1. **`LOG_LEVEL` is hardcoded to `"4"`** in `config/index.ts` (`LOG_LEVEL: "4"`), not read from `process.env`. Winston expects level strings like `"debug" | "info" | "warn" | "error"`, so `"4"` isn't a recognized level — setting `LOG_LEVEL` in `.env` currently has no effect at all.
-2. **`package.json` name is `"Notification Service"`**, not something referencing the API Gateway — likely left over from copying `package.json` from the notification service.
-3. **Several dependencies look unrelated to a gateway** — `@langchain/*`, `mongoose`, `resend` are present in `package.json` but nothing under `src/` imports them. Also carried over, most likely.
+2. **`package.json` name is `"Notification Service"`**, not something referencing the API Gateway — likely left over from copying `package.json` from the notification service. This isn't just cosmetic: `config.SERVICE_NAME` is set to `packageJson.name`, and `config/logger.ts` attaches `SERVICE_NAME` to every log line as the `service` field — so every log this gateway emits is currently tagged `[Notification Service]` instead of something identifying it as the gateway.
+3. **Several dependencies look unrelated to a gateway** — `@langchain/*`, `mongoose`, `resend`, and `kafkajs` are all present in `package.json` but nothing under `src/` imports any of them. Also carried over, most likely.
 4. **`npm run seed` points at `src/services/seed.ts`**, which doesn't exist in this project — running that script will fail.
-5. **The Razorpay-webhook raw-body branch in `index.ts`** checks for `req.path === "/api/payments/webhooks/razorpay"`, but no `/payments/*` route exists in `routes/index.ts` yet — currently unreachable code, harmless but dead until a payments route is added.
-6. **`RedisClient.closeConnection()`, `isReady()`, `testConnection()`** are defined in `config/redis.ts` but never called anywhere — the Redis connection isn't closed during `gracefulShutdown()` in `index.ts`, and there's no health endpoint reporting Redis status.
-7. **`getCircuitBreakerStatus()`** (in `services/proxy.ts`) is exported but not called by any route — there's no way to inspect circuit breaker state over HTTP today.
-8. **Some configured service URLs still have no routes** — `SEARCH_SERVICE_URL`, `NOTIFICATION_SERVICE_URL`, and `INVENTORY_SERVICE_URL` are all configured and have circuit breakers pre-created, but no route in `routes/index.ts` proxies to any of them. `userService` and `adminService` were already proxied to before this pass; `bookingService` and `paymentService` (webhook only) were added across two later passes (see booking-service's and payment-service's own docs) — four of seven downstream services are now reachable in principle. The login-routing bug this doc used to describe elsewhere is fixed now (user-service dropped its `/api/v1` prefix), so `requireAuth`-gated routes like booking's can actually obtain a JWT; the payment webhook route never needed one in the first place (Razorpay calls it directly, verified by its own signature) — it's blocked only by the lack of a real Razorpay account to send one.
-9. **`src/types/index.ts` is empty** — no shared types are defined there despite the file existing.
-10. **`BadRequestError`, `ForbiddenError`, `ConflictError`, `InternalServerError`** are defined in `utils/error.ts` but nothing in the current codebase throws them.
+5. **`RedisClient.closeConnection()`, `isReady()`, `testConnection()`** are defined in `config/redis.ts` but never called anywhere — the Redis connection isn't closed during `gracefulShutdown()` in `index.ts`, and there's no health endpoint reporting Redis status.
+6. **`getCircuitBreakerStatus()`** (in `services/proxy.ts`) is exported but not called by any route — there's no way to inspect circuit breaker state over HTTP today.
+7. **Some configured service URLs still have no routes** — `SEARCH_SERVICE_URL`, `NOTIFICATION_SERVICE_URL`, and `INVENTORY_SERVICE_URL` are all configured and have circuit breakers pre-created, but no route in `routes/index.ts` proxies to any of them. `userService` and `adminService` were already proxied to before this pass; `bookingService` and `paymentService` (webhook only) were added across two later passes (see booking-service's and payment-service's own docs) — four of seven downstream services are now reachable in principle. The login-routing bug this doc used to describe elsewhere is fixed now (user-service dropped its `/api/v1` prefix), so `requireAuth`-gated routes like booking's can actually obtain a JWT; the payment webhook route never needed one in the first place (Razorpay calls it directly, verified by its own signature) — it's blocked only by the lack of a real Razorpay account to send one.
+8. **`src/types/index.ts` is empty** — no shared types are defined there despite the file existing.
+9. **`BadRequestError`, `ForbiddenError`, `ConflictError`, `InternalServerError`** are defined in `utils/error.ts` but nothing in the current codebase throws them.
+10. **`config.ACCESS_TOKEN_EXP`, `REFRESH_TOKEN_EXP`, `ACCESS_TOKEN_EXP_SEC`, and `REFRESH_TOKEN_EXP_SEC`** are all loaded from `process.env` in `config/index.ts`, but nothing else in `api-gateway/src` reads any of them back out. The gateway doesn't issue or refresh tokens itself — that's user-service's job — so these look like leftovers from copying `config/index.ts` from a service that does.
 
 None of the above are being changed as part of this documentation pass — flagging them here so they're visible next time someone works on this service.

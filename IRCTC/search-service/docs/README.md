@@ -47,13 +47,17 @@ The **Search Service** is IRCTC's read-optimized search layer, backed by Elastic
 └──────────────┬───────────────┘        └──────────────┬───────────────┘
                │ Kafka                                  │ Kafka
                │ admin.station-created  ✅ fires today   │ inventory.seat-
-               │ admin.route-created    ❌ never fires   │ availability-updated
-               │   (publish call is commented out in     │
-               │    admin-service's train.service.ts)     │
-               │ admin.schedule-created ❌ never fires    │
-               │   (the HTTP route that triggers it is    │
-               │    never mounted in admin-service)       │
-               │ admin.schedule-cancelled                 │
+               │ admin.route-created    ✅ fires today   │ availability-updated
+               │   (train.service.ts's createRoute calls  │ ✅ fires today
+               │    adminProducer.publishRouteCreated —   │ (inventory.service.ts
+               │    reachable via POST /trains/route)      │ calls it in 7 places)
+               │ admin.schedule-created ✅ fires today    │
+               │   (schedule.service.ts's createSchedule  │
+               │    calls publishScheduleCreated —         │
+               │    reachable via POST /schedules/schedule)│
+               │ admin.schedule-cancelled ❌ never fires   │
+               │   (publishScheduleCancelled has no caller │
+               │    anywhere in admin-service)             │
                ▼                                          ▼
 ┌───────────────────────────────────────────────────────────────────────┐
 │                          SEARCH SERVICE                                │
@@ -176,22 +180,29 @@ search-service/
     DLQ_MAX_RETRIES times before publishing the raw message to dlq.search-service.
 ```
 
-### Case B: `ROUTE_CREATED` event — subscribed to, but structurally can never arrive
+### Case B: `ROUTE_CREATED` event arrives (also reachable today — this doc previously said it never fires)
 
 ```
-1.  SearchConsumer subscribes to KAFKA_TOPICS.ROUTE_CREATED and, if a message ever
-    arrived, would cast it to RouteCreatedEvent and call
-    searchService.indexTrainRoute({ train, routeStations }) — fully implemented,
-    would index a "trains" document with a nested route and a seatSummary.
-2.  In practice this never happens: admin-service's trainService.createRoute has its
-    adminProducer.publishRouteCreated(...) call commented out (verified directly in
-    admin-service's source this session — see that service's own docs, Known Issue
-    about the commented-out publish). No producer in this system ever sends a
-    message on admin.route-created today.
-3.  Net effect: the "trains" Elasticsearch index can never actually be populated
-    through this consumer as the system is currently wired, independent of anything
-    in this service — this service's own compile errors are fixed, but the upstream
-    gap in admin-service is not.
+1.  admin-service's trainService.createRoute publishes to admin.route-created after
+    inserting the Route + RouteStation rows — reachable via POST /trains/route.
+    The publish call passes the denormalized { ...route, train: existingTrain }
+    (train includes its seats) so this consumer doesn't need to call back into
+    admin-service for anything.
+2.  SearchConsumer.start()'s consumer.run() receives the message on topic
+    KAFKA_TOPICS.ROUTE_CREATED
+3.  withDLQ(...) parses the message value as JSON → parsedValue: unknown
+4.  switch(topic) matches ROUTE_CREATED → parsedValue is cast to RouteCreatedEvent
+    and passed to searchService.indexTrainRoute({ train, routeStations })
+5.  indexTrainRoute builds a seatSummary by counting train.seats by seatType, builds
+    a TrainDocument (trainId/trainNumber/trainName/route/schedules: []/seatSummary),
+    and esClient.index()'s it into the "trains" index
+6.  It then also re-indexes every station in routeStations into the "stations"
+    index (same shape as indexStation) so autocomplete stays current for stations
+    that were created before this route existed
+7.  logger.info(`Indexed train ${train.trainNumber} with ${routeStations.length} stations`)
+8.  indexTrainRoute has no internal try/catch — if either esClient.index() call
+    throws, the error propagates out to withDLQ, which retries up to
+    DLQ_MAX_RETRIES times before publishing the raw message to dlq.search-service.
 ```
 
 ### Case C: A search request over HTTP (now reachable — was documented as unreachable before this session)
@@ -320,6 +331,9 @@ Startup order: build/recreate Elasticsearch indices first (`ES_RECREATE_INDICES=
 import { readFileSync } from "fs";
 import { resolve } from "path";
 
+// require("../../package.json") would type package.json's export as `any`;
+// reading + parsing it manually keeps the `any` confined to this one
+// external-boundary assertion instead of leaking into Config.SERVICE_NAME.
 const packageJsonPath = resolve(process.cwd(), "./package.json");
 const packageJson = JSON.parse(readFileSync(packageJsonPath, "utf-8")) as {
   name: string;
@@ -879,13 +893,13 @@ A `.env.example` matching the block above was added this session (didn't exist b
 | Topic | Subscribed here? | Actually fires in this system today? |
 |---|---|---|
 | `admin.station-created` | ✅ → `indexStation` | ✅ yes — admin-service's `stationService.createStation` publishes it on every `POST /stations/station` |
-| `admin.route-created` | ✅ → `indexTrainRoute` | ❌ no — admin-service's only call to `publishRouteCreated` is commented out (verified in that service's own source/docs this session) |
-| `admin.schedule-created` | ✅ → `indexSchedule` | ❌ no — the publish call itself is correct in admin-service, but the HTTP route that would trigger it (`schedule.route.ts`) is never mounted there |
-| `admin.schedule-cancelled` | ✅ → `cancelSchedule` | ❌ no — nothing in admin-service calls `publishScheduleCancelled` at all |
-| `inventory.seat-availability-updated` | ✅ → `updateSeatAvailability` | Not verified this session — inventory-service's source wasn't reviewed as part of this pass |
-| `dlq.search-service` | Published to (not subscribed) | Only when a handler above throws 3 times in a row for the same message (`DLQ_MAX_RETRIES`) — now actually reachable for all four index-side handlers, since their internal try/catch blocks were removed this session |
+| `admin.route-created` | ✅ → `indexTrainRoute` | ✅ yes — admin-service's `trainService.createRoute` calls `adminProducer.publishRouteCreated(...)` (not commented out), reachable via `POST /trains/route`. This doc previously said this call was commented out; that was stale by the time of this staleness audit — the call is live in current source |
+| `admin.schedule-created` | ✅ → `indexSchedule` | ✅ yes — `scheduleService.createSchedule` calls `publishScheduleCreated`, and `schedule.route.ts` is mounted at `/schedules` in admin-service's `server.ts` (`POST /schedules/schedule`). This doc previously said the route was never mounted; that was stale — it is mounted in current source |
+| `admin.schedule-cancelled` | ✅ → `cancelSchedule` | ❌ no — `publishScheduleCancelled` exists on `admin.producer.ts` but nothing in admin-service calls it anywhere (still true as of this audit) |
+| `inventory.seat-availability-updated` | ✅ → `updateSeatAvailability` | ✅ yes — inventory-service's `inventory.service.ts` calls `inventoryProducer.publishSeatAvailabilityUpdated(...)` in 7 places (not commented out). Confirmed by reading the source during this audit; still not verified against a live broker |
+| `dlq.search-service` | Published to (not subscribed) | Only when a handler above throws 3 times in a row for the same message (`DLQ_MAX_RETRIES`) — reachable for all five index-side handlers, since their internal try/catch blocks were removed in an earlier session |
 
-In short: as the rest of this system is currently wired, only station-creation events are known to actually reach this consumer — everything else this service subscribes to depends on gaps documented in admin-service's own docs, not on anything in this service.
+In short: as the rest of this system is currently wired, `STATION_CREATED`, `ROUTE_CREATED`, `SCHEDULE_CREATED`, and `SEAT_AVAILABILITY_UPDATED` are all known to actually reach this consumer today — only `SCHEDULE_CANCELLED` remains structurally unreachable (no caller anywhere in admin-service). This is a reversal of what an earlier version of this doc claimed (that only station-creation events fired); see [Known Issues](#known-issues--inconsistencies) items 9–10 for what changed.
 
 ---
 
@@ -894,7 +908,7 @@ In short: as the rest of this system is currently wired, only station-creation e
 | Index (constant) | Created by `initIndices`? | Written by | Read by |
 |---|---|---|---|
 | `stations` (`STATION_INDEX`) | ✅ | `indexStation`, `indexTrainRoute`'s per-station loop | `resolveStation`, `autocompleteStation`, `getAllStations` |
-| `trains` (`TRAIN_INDEX`) | ✅ | `indexTrainRoute`, `indexSchedule`, `cancelSchedule`, `updateSeatAvailability` | `searchTrains`, `getAllTrains` |
+| `trains` (`TRAIN_INDEX`) | ✅ | `indexTrainRoute`, `indexSchedule`, `cancelSchedule`, `updateSeatAvailability` — all four are now confirmed reachable in practice (see Kafka Topics Reference above), except `cancelSchedule` which needs `admin.schedule-cancelled` to fire and that topic still never does | `searchTrains`, `getAllTrains` |
 | `routes` (`ROUTE_INDEX`) | ❌ never created | — | — |
 | `schedules` (`SCHEDULE_INDEX`) | ❌ never created | — | — |
 
@@ -929,8 +943,9 @@ curl "http://localhost:4002/trains?from=NDLS&to=BCT"
 ## Debugging Tips
 
 - **A station never shows up in Elasticsearch even though it was created in admin-service** → check this consumer's own logs; an Elasticsearch failure inside `indexStation` now propagates to `withDLQ` and, after `DLQ_MAX_RETRIES` attempts, lands on `dlq.search-service` — check that topic, not just the console, for dropped writes. Also confirm `KAFKA_BROKER`/`ELASTICSEARCH_URL` point at reachable services.
-- **Trains never appear in the `trains` index no matter what** → this isn't a bug in this service to chase — admin-service never actually publishes `admin.route-created` today (see the Kafka Topics table above), so `indexTrainRoute` is never invoked in practice.
-- **Schedules never update a train's `schedules` array** → same root cause, different reason: the admin-service HTTP route that would trigger `admin.schedule-created` isn't mounted there.
+- **Trains never appear in the `trains` index** → check whether `admin.route-created` actually fired (an earlier version of this doc said it structurally couldn't — that's no longer true; admin-service's `POST /trains/route` does publish it today). If the topic did fire, check this consumer's logs / `dlq.search-service` for a failed `indexTrainRoute` instead.
+- **Schedules never get added to a train's `schedules` array** → same shape of check: `admin.schedule-created` is reachable today via `POST /schedules/schedule` in admin-service (an earlier version of this doc said the route wasn't mounted — it now is), so look at `indexSchedule`'s logs / DLQ rather than assuming the event never fires.
+- **A schedule cancellation never reflects in Elasticsearch** → this one genuinely can't happen yet: nothing in admin-service calls `publishScheduleCancelled`, so `cancelSchedule` is never invoked regardless of what this service does.
 - **`GET /trains` responds with `{ trains: [], message: "Station ... not found" }`** → `resolveStation` couldn't find that station via exact code match, completion suggester, or fuzzy `multi_match` — check the `stations` index actually has a document for it (`GET /debug/stations`).
 - **`GET /debug/stations` or `/debug/trains` looks empty** → these call `getAllStations()`/`getAllTrains()` (a plain `match_all` query, `size: 100`) — an empty result means the corresponding index genuinely has no documents yet, most likely because the Kafka events that would populate it (see the topics table) haven't fired.
 - **`ES_RECREATE_INDICES=true` and startup takes a while / logs "Deleted index"** → that's `recreateIndices()` wiping and rebuilding `stations`/`trains` from scratch; unset it (or set to anything other than `"true"`) for a normal create-if-missing startup.
@@ -940,7 +955,7 @@ curl "http://localhost:4002/trains?from=NDLS&to=BCT"
 
 ## Known Issues & Inconsistencies
 
-Observed while reviewing the code — documented here rather than fixed, since these are informational (same approach as the API Gateway's, Notification Service's, and Admin Service's docs). Items 1–7 describe this session's fixes (kept here for the historical record of what was wrong and why); items 8+ are pre-existing and still open.
+Observed while reviewing the code — documented here rather than fixed, since these are informational (same approach as the API Gateway's, Notification Service's, and Admin Service's docs). Items 1–7 describe an earlier session's fixes to this service's own code (kept here for the historical record of what was wrong and why); items 8, 11–16 are pre-existing and still open; items 9–10 describe upstream admin-service behavior that a later staleness audit found had changed (or had simply been misdocumented) since this doc was last updated — see each item for detail.
 
 1. **This doc previously described the wrong build blocker.** An earlier version claimed `index.ts` imported a nonexistent `./routes/search.route` (singular) and default-imported a nonexistent `errorHandler`. Both claims were already stale by the start of this session — `index.ts` already correctly imported `./routes/search.routes` (plural) and the named export `{ errorMiddleware }`. That description has been corrected throughout this doc.
 2. **The real build blockers, found and fixed this session:**
@@ -952,8 +967,8 @@ Observed while reviewing the code — documented here rather than fixed, since t
 6. **Four index-operation functions used to swallow their own Elasticsearch errors.** `indexStation`, `indexSchedule`, `cancelSchedule`, and `updateSeatAvailability` each had a try/catch that logged an ES error and returned normally — since `withDLQ` (wrapping the whole `eachMessage` handler) only retries/forwards errors that propagate *out* of the wrapped handler, an Elasticsearch outage inside any of these four used to be silently dropped instead of landing on `dlq.search-service`. Fixed by removing all four try/catch blocks so errors now propagate to `withDLQ`. `indexTrainRoute` already had no internal try/catch and needed no change.
 7. **`notFound` (in `middlewares/not-found.middleware.ts`) was fully written but never mounted.** `index.ts` never called `app.use(notFound)`, so unmatched routes fell through to Express's default 404 page instead of this service's JSON error shape. Fixed by mounting it right before `errorMiddleware`. Its own comment also used to say it was "Registered in index.ts right after `app.use(\"/api\", gatewayRouter)`" — a copy-paste from api-gateway, not accurate here — corrected to describe its actual mount point (right after `searchRoutes`).
 8. **`ROUTE_INDEX` and `SCHEDULE_INDEX`** (in `config/elasticsearch.ts`) name Elasticsearch indices that `initIndices`/`recreateIndices` never create — route and schedule data live inside the `trains` index's nested `route`/`schedules` fields instead. Predates this session, unchanged.
-9. **`admin.route-created` never actually fires.** Verified directly in admin-service's source: `trainService.createRoute`'s call to `adminProducer.publishRouteCreated(...)` is commented out. This means `indexTrainRoute` — the only code path that ever creates a `trains` index document — is never invoked in the system as currently wired, independent of anything in this service. Predates this session.
-10. **`admin.schedule-created` never actually fires either**, for a different reason: admin-service's `schedule.service.ts` does correctly call `publishScheduleCreated`, but the HTTP route that would trigger schedule creation (`schedule.route.ts`) is never mounted in admin-service's `server.ts`. Predates this session.
+9. **`admin.route-created` now actually fires — this doc previously said otherwise.** A prior version of this doc claimed `trainService.createRoute`'s call to `adminProducer.publishRouteCreated(...)` was commented out. As of this staleness audit, that's not true: the call is live (`train.service.ts` line ~145, wrapped in a `.catch` that logs rather than rethrows), reachable via `POST /trains/route`, so `indexTrainRoute` is invoked for real whenever a route is attached to a train. Whether admin-service's own commit history actually re-enabled this call, or the earlier doc was simply wrong, wasn't investigated — only current source was checked.
+10. **`admin.schedule-created` now actually fires too — also previously misdocumented.** A prior version of this doc said the HTTP route that triggers schedule creation was never mounted in admin-service. As of this audit, `admin-service/src/server.ts` does `app.use("/schedules", scheduleRoutes)`, and `schedule.route.ts` maps `POST /schedule` (→ `/schedules/schedule`) to `scheduleController.createSchedule`, which calls `scheduleService.createSchedule`, which calls `adminProducer.publishScheduleCreated(...)` unconditionally (not wrapped in `.catch` — a Kafka failure there throws and turns the request into a 500, per that function's own comment). So `indexSchedule` is invoked for real on every successful schedule creation.
 11. **Not verified against live infrastructure.** No Elasticsearch cluster or Kafka broker was reachable in the environment this session's fixes were made in. Everything above about the service "working" means it type-checks and the logic reads correctly — nobody has observed a station actually land in a live `stations` index, or a live `GET /trains` call return real results, since these fixes were made. Treat this as the single biggest open risk before calling this service done.
 12. **`config/logger.ts`'s inline comment about `LOG_LEVEL` being hardcoded to `"4"` is stale** — that was true of an earlier version of `config/index.ts`; the current one reads `process.env.LOG_LEVEL || "info"`. Purely a documentation artifact in the code, predates this session, not a functional issue.
 13. **Two files share the basename `search.service.ts`** — the Kafka consumer at `src/kafka/search.service.ts` and the indexing/search logic at `src/services/search.service.ts`. Both compile and import each other correctly (via distinct relative paths), but it's an easy source of confusion when searching the codebase by filename alone.
@@ -961,4 +976,4 @@ Observed while reviewing the code — documented here rather than fixed, since t
 15. **`npm run seed` points at `src/services/seed.ts`**, which doesn't exist in this project — running that script fails. The same issue is already flagged in several other services' docs in this repo, likely from a shared `package.json` origin.
 16. **Unrelated dependencies in `package.json`**: `@langchain/cohere`, `@langchain/core`, `@langchain/groq`, `@langchain/openai`, `mongoose`, `resend`, `morgan`, `jsonwebtoken`, `ioredis` are all listed, but nothing in `src/` imports any of them now that the auth/rate-limit/redis scaffold files that used to reference some of them (`jsonwebtoken`, `ioredis`) are deleted. Worth pruning from `package.json` at some point, though that's a `package.json` change, not something this documentation pass makes.
 
-None of the above (aside from what's described as fixed in items 1–7, which were fixed in the session this doc was updated to reflect) are being changed as part of this documentation pass — flagging the rest here so they're visible next time someone works on this service.
+None of the above (aside from what's described as fixed in items 1–7, and the corrected upstream-firing status in items 9–10) are being changed as part of this documentation pass — flagging the rest here so they're visible next time someone works on this service. This pass only ever edits this file, never `search-service/src/` or any other service's code.

@@ -204,10 +204,12 @@ Service"`** — leftover from copying the file when the gateway was
   create-payment step since Payment Service has no real Razorpay credentials.
   See `booking-service/docs/README.md` and `docs/api-contract.md` §7.
 - **Inventory Service now exists and typechecks**, but isn't verified against a
-  real Postgres/Kafka, isn't proxied through the Gateway yet, and can't receive
-  a real event even once running — admin-service's `POST /schedule` (the only
-  trigger for `admin.schedule-created`) is still never mounted. See
+  real Postgres/Kafka, and isn't proxied through the Gateway yet. It *can* now
+  receive a real event once running — admin-service's `POST /schedules/schedule`
+  is mounted and does publish `admin.schedule-created` — but since there's no
+  Gateway route to it, triggering that still means calling admin-service
+  directly rather than through any normal client flow. See
   `inventory-service/docs/README.md` and `docs/api-contract.md` §6.
-- **User Service has no `docs/README.md` yet** — unlike the other six
-  services. `docs/auth.md` and the root `README.md` are the best references
-  for it today.
+- ~~User Service has no `docs/README.md` yet~~ **No longer true.**
+  `user-service/docs/README.md` exists and is as complete as the other seven
+  services' docs.

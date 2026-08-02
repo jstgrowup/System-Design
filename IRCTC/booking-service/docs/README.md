@@ -489,19 +489,22 @@ async function tryAcquireLeadership(): Promise<boolean> {
     const result = await redis.set(
       LEADER_KEY,
       process.pid.toString(),
-      "NX",
       "EX",
       LEADER_TTL_SECONDS,
+      "NX",
     );
     return result === "OK";
   } catch (err) {
-    logger.error("Failed to acquire expiry job leadership", { error: (err as Error).message });
+    // If Redis is down, skip this cycle rather than having all instances run
+    logger.error("Failed to acquire expiry job leadership", {
+      error: (err as Error).message,
+    });
     return false;
   }
 }
 ```
 
-`SET key value NX EX seconds` is a single atomic Redis command — either this instance is the first to call it this cycle (and becomes leader) or it isn't (another replica already holds the key), with no race window between "check" and "set." `LEADER_TTL_SECONDS` (25s) is deliberately shorter than the sweep interval (30s default) so a crashed leader's lock expires before the next cycle would otherwise be blocked waiting for it. This is the same pattern inventory-service uses for its own lock-expiry job, just backed by Redis instead of a Postgres advisory lock (this service already holds a Redis connection for seat locks, so it was the natural choice here).
+`SET key value EX seconds NX` is a single atomic Redis command — either this instance is the first to call it this cycle (and becomes leader) or it isn't (another replica already holds the key), with no race window between "check" and "set." `LEADER_TTL_SECONDS` (25s) is deliberately shorter than the sweep interval (30s default) so a crashed leader's lock expires before the next cycle would otherwise be blocked waiting for it. This is the same pattern inventory-service uses for its own lock-expiry job, just backed by Redis instead of a Postgres advisory lock (this service already holds a Redis connection for seat locks, so it was the natural choice here).
 
 ---
 

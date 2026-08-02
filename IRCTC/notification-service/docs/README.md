@@ -261,7 +261,10 @@ export async function startNotificationService(): Promise<void> {
 
     await emailConsumer.start();
     logger.info("✅ Notification Service started successfully");
+    logger.info("Service is ready to process notifications");
   } catch (error) {
+    console.log(error);
+
     const err = error as Error;
     logger.error("Failed to start Notification Service", { error: err.message, stack: err.stack });
     process.exit(1);   // the whole process exits if startup fails
@@ -278,7 +281,7 @@ process.on("uncaughtException", (error: Error) => {
 });
 ```
 
-In plain English: if `RESEND_API_KEY`, `MAIL_SEND`, or `KAFKA_BROKER` aren't set, the service logs an error and exits immediately rather than starting half-broken. `mongoose` is imported at the top of this file but never actually used — likely a leftover from an earlier version that did talk to a database.
+In plain English: if `RESEND_API_KEY`, `MAIL_SEND`, or `KAFKA_BROKER` aren't set, the service logs an error and exits immediately rather than starting half-broken. Note the catch block also does a plain `console.log(error)` before the structured `logger.error` call — so a startup failure prints twice, once as a raw console dump and once as a formatted log line. `mongoose` is imported at the top of this file but never actually used — likely a leftover from an earlier version that did talk to a database.
 
 **`config/kafka.ts`** — sets up the Kafka client, the consumer that reads messages, and a separate producer used only to publish to the dead-letter queue:
 
@@ -286,7 +289,13 @@ In plain English: if `RESEND_API_KEY`, `MAIL_SEND`, or `KAFKA_BROKER` aren't set
 const kafka = new Kafka({
   clientId: config.KAFKA_CLIENT_ID,
   brokers: [config.KAFKA_BROKER || "localhost:9093"],
-  retry: { initialRetryTime: 300, retries: 10, maxRetryTime: 30000, multiplier: 2 },
+  logLevel: logLevel.ERROR,
+  retry: {
+    initialRetryTime: 300,
+    retries: 10,
+    maxRetryTime: 30000,
+    multiplier: 2,
+  },
 });
 
 const consumer: Consumer = kafka.consumer({
@@ -298,7 +307,7 @@ const consumer: Consumer = kafka.consumer({
 const producer: Producer = kafka.producer({ allowAutoTopicCreation: true, retry: { retries: 3 } });
 ```
 
-The producer is only connected lazily, the first time something needs to go to the DLQ (`connectProducer()`), not at startup — since most messages never need it. `SIGTERM`/`SIGINT` both trigger a graceful shutdown that disconnects the consumer (and producer, if it was ever connected) before exiting.
+The producer is only connected lazily, the first time something needs to go to the DLQ (`connectProducer()`), not at startup — since most messages never need it. `SIGTERM`/`SIGINT` both trigger a graceful shutdown that disconnects the consumer (and producer, if it was ever connected) before exiting. Note `logLevel: logLevel.ERROR` on the Kafka client — kafkajs's own internal logs (connection attempts, retries, broker metadata) are suppressed down to errors only, which is part of why a bad `KAFKA_BROKER` can look like total silence for a while rather than a stream of visible retry attempts.
 
 **`config/logger.ts`** — a single shared Winston logger, reads `LOG_LEVEL` from config (unlike the API Gateway, where the equivalent value is hardcoded and broken):
 
@@ -323,40 +332,78 @@ const logger = winston.createLogger({
 
 ```typescript
 async start(): Promise<void> {
-  await consumer.connect();
-  await connectProducer();               // ready in case we need the DLQ
+    try {
+      await consumer.connect();
+      await connectProducer(); // needed for DLQ publishing
 
-  await consumer.subscribe({
-    topics: Object.values(KAFKA_TOPICS),  // literally every topic that exists — see Known Issue #6
-    fromBeginning: false,
-  });
+      logger.info("Email consumer connected to Kafka");
 
-  await consumer.run({
-    eachMessage: withDLQ(
-      producer,
-      KAFKA_TOPICS.DLQ_NOTIFICATION,
-      logger,
-      async ({ topic, parsedValue }) => {
-        await this.handleMessage(topic, parsedValue);
-      },
-    ),
-  });
-}
+      // KAFKA_TOPICS is shared across every service, so this subscribes to
+      // admin/inventory/payment/DLQ topics too, not just the ones handled
+      // below — those all fall through to the "Unknown topic" warning.
+      await consumer.subscribe({
+        topics: Object.values(KAFKA_TOPICS),
+        fromBeginning: false,
+      });
+
+      await consumer.run({
+        eachMessage: withDLQ(
+          producer,
+          KAFKA_TOPICS.DLQ_NOTIFICATION,
+          logger,
+          async ({
+            topic,
+            parsedValue,
+          }: {
+            topic: KafkaTopic;
+            parsedValue: unknown;
+          }) => {
+            logger.info(`Processing message from topic: ${topic}`);
+            await this.handleMessage(topic, parsedValue);
+          },
+        ),
+      });
+
+      logger.info("Email consumer is running and listening for messages...");
+    } catch (error) {
+      const err = error as Error;
+      logger.error("Failed to start email consumer", { error: err.message });
+      throw error;
+    }
+  }
 ```
+
+If `consumer.connect()`, `subscribe()`, or `run()` throw during startup, this method logs the error and re-throws — which is what makes `startNotificationService()` in `db.ts` catch it and call `process.exit(1)`.
 
 **Routing — one topic, one handler:**
 
 ```typescript
 private async handleMessage(topic: KafkaTopic, data: unknown): Promise<void> {
-  switch (topic) {
-    case KAFKA_TOPICS.OTP_EMAIL:          await this.handleOtpEmail(data as OtpEmailData); break;
-    case KAFKA_TOPICS.WELCOME_EMAIL:      await this.handleWelcomeEmail(data as WelcomeEmailData); break;
-    case KAFKA_TOPICS.BOOKING_CONFIRMED:  await this.handleBookingConfirmed(data as BookingConfirmedData); break;
-    case KAFKA_TOPICS.BOOKING_FAILED:     await this.handleBookingFailed(data as BookingFailedData); break;
-    case KAFKA_TOPICS.BOOKING_CANCELLED:  await this.handleBookingCancelled(data as BookingCancelledData); break;
-    default: logger.warn(`Unknown topic: ${topic}`);
+    switch (topic) {
+      case KAFKA_TOPICS.OTP_EMAIL:
+        await this.handleOtpEmail(data as OtpEmailData);
+        break;
+
+      case KAFKA_TOPICS.WELCOME_EMAIL:
+        await this.handleWelcomeEmail(data as WelcomeEmailData);
+        break;
+
+      case KAFKA_TOPICS.BOOKING_CONFIRMED:
+        await this.handleBookingConfirmed(data as BookingConfirmedData);
+        break;
+
+      case KAFKA_TOPICS.BOOKING_FAILED:
+        await this.handleBookingFailed(data as BookingFailedData);
+        break;
+
+      case KAFKA_TOPICS.BOOKING_CANCELLED:
+        await this.handleBookingCancelled(data as BookingCancelledData);
+        break;
+
+      default:
+        logger.warn(`Unknown topic: ${topic}`);
+    }
   }
-}
 ```
 
 Anything not in that list — including `notification.booking-email`, `notification.payment-email`, every `admin.*`/`inventory.*`/`payment.*` topic, and every service's DLQ topic (this service is subscribed to all of them) — falls into `default` and is just logged as "Unknown topic."
@@ -378,7 +425,7 @@ private async handleBookingConfirmed(data: BookingConfirmedData): Promise<void> 
 }
 ```
 
-The comment right above this in the source is worth repeating verbatim, because it explains a real gap: *"BookingConfirmedData has no `email` field — it comes from a separate source on the event; adjust this once you confirm where email actually lives on the real Kafka payload."* In other words: today, this only sends an email if the incoming JSON happens to carry an extra `email` property that isn't part of the documented type.
+The comment right above this in the source is worth repeating verbatim, because it explains a real gap: *"BookingConfirmedData has no `email` field — it comes from a separate source on the event; adjust this once you confirm where email actually lives on the real Kafka payload (see note below)."* In other words: today, this only sends an email if the incoming JSON happens to carry an extra `email` property that isn't part of the documented type.
 
 ---
 
@@ -394,7 +441,7 @@ private async sendWithRetry(msg: EmailMessage, retries = 0): Promise<SendResult>
     });
     if (error) throw new Error(error.message);
 
-    logger.info(`Email sent successfully to ${msg.to}`, { attempt: retries + 1, id: data?.id });
+    logger.info(`Email sent successfully to ${msg.to}`, { subject: msg.subject, attempt: retries + 1, id: data?.id });
     return { success: true };
   } catch (error: any) {
     logger.error(`Email sending failed (attempt ${retries + 1}/${this.maxRetries})`, { to: msg.to, error: error.message });
@@ -412,12 +459,18 @@ private async sendWithRetry(msg: EmailMessage, retries = 0): Promise<SendResult>
 **The five public methods** all follow the same pattern: build a subject + HTML body from a template, then call `sendWithRetry`.
 
 ```typescript
-async sendOtpEmail(email: string, otp: string, ttlMinutes: number): Promise<SendResult> {
-  return this.sendWithRetry({
-    to: email, from: this.from,
+async sendOtpEmail(
+  email: string,
+  otp: string,
+  ttlMinutes: number,
+): Promise<SendResult> {
+  const msg: EmailMessage = {
+    to: email,
+    from: this.from,
     subject: "Your DesignKarle verification code",
     html: getOtpTemplate(otp, ttlMinutes),
-  });
+  };
+  return this.sendWithRetry(msg);
 }
 ```
 
@@ -559,5 +612,6 @@ Observed while reviewing the code — documented here rather than fixed, since t
 11. **The three booking handlers** (`handleBookingConfirmed/Failed/Cancelled`) read `.email` off the incoming data via a cast to `{ email?: string }`, but the actual typed interfaces (`BookingConfirmedData`, etc.) have no `email` field. As written, these three handlers only send an email if the real Kafka payload happens to carry an extra `email` property outside the documented type — otherwise they silently log a warning and skip sending.
 12. **File name typo**: `shared/utils/dlqHanlder.ts` is missing the "d" in "Handler." The file's own header comment references the correctly-spelled `dlqHandler` in its usage example, which doesn't match the real file name.
 13. **`npm run seed` points at `src/services/seed.ts`**, which doesn't exist in this project — running that script will fail (same issue flagged in the API Gateway's docs, likely from a shared `package.json` origin).
+14. **`startNotificationService`'s catch block calls both `console.log(error)` and `logger.error(...)`** — a startup failure gets printed twice: once as a raw, unformatted console dump of the error object, and once as a structured Winston log line. Likely leftover debug code that was never cleaned up.
 
 None of the above are being changed as part of this documentation pass — flagging them here so they're visible next time someone works on this service.
