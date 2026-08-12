@@ -1,7 +1,6 @@
 import prisma from "../config/prisma";
 import { BadRequestError, ConflictError, ForbiddenError } from "../utils/error";
 import bcrypt from "bcrypt";
-import jwt from "jsonwebtoken";
 import { generateAndStoreOtp, verifyOtpViaUnHashing } from "../utils/otp";
 import {
   generateAccessToken,
@@ -132,29 +131,28 @@ const login = async ({
   }
 
   const accessToken = generateAccessToken(existingUser.id);
-  const refreshToken = generateRefreshToken(existingUser.id);
+  // JTI (unique token ID) comes back straight from generateRefreshToken — no
+  // need to re-decode the token we just signed to recover it.
+  const { token: refreshToken, jti } = generateRefreshToken(existingUser.id);
 
-  // Decode the refresh token to extract the JTI (unique token ID)
-  // JTI is used to detect refresh token reuse attacks
-  const data = jwt.decode(refreshToken) as { jti: string };
-
-  // Store JTI in Redis keyed by userId + deviceId
-  // This allows one active session per device per user
-  await redis.set(
-    `refresh:${existingUser.id}:${deviceId}`,
-    data.jti,
-    "EX",
-    config.REFRESH_TOKEN_EXP_SEC,
-  );
-
-  // Cache the user object (without password) for fast lookups
   const { password: _password, ...safeUser } = existingUser;
-  await redis.set(
-    `user:${existingUser.id}`,
-    JSON.stringify(safeUser),
-    "EX",
-    config.REDIS_USER_TTL,
-  );
+
+  // Store the JTI (keyed by userId + deviceId, for reuse detection) and cache
+  // the user profile in parallel — neither write depends on the other.
+  await Promise.all([
+    redis.set(
+      `refresh:${existingUser.id}:${deviceId}`,
+      jti,
+      "EX",
+      config.REFRESH_TOKEN_EXP_SEC,
+    ),
+    redis.set(
+      `user:${existingUser.id}`,
+      JSON.stringify(safeUser),
+      "EX",
+      config.REDIS_USER_TTL,
+    ),
+  ]);
 
   return { accessToken, refreshToken, loggedInUser: safeUser };
 };
@@ -190,15 +188,17 @@ const rotateRefreshToken = async ({
     throw new ForbiddenError("Refresh token reused", "LOGIN_AGAIN");
   }
 
-  // Issue new tokens
+  // Issue new tokens. generateRefreshToken returns the jti alongside the
+  // signed token, so there's no need to jwt.decode() it back out here.
   const newAccessToken = generateAccessToken(payload.id);
-  const newRefreshToken = generateRefreshToken(payload.id);
+  const { token: newRefreshToken, jti: newJti } = generateRefreshToken(
+    payload.id,
+  );
 
-  // Decode and store the new JTI, replacing the old one
-  const response = jwt.decode(newRefreshToken) as { jti: string };
+  // Store the new JTI, replacing the old one
   await redis.set(
     `refresh:${payload.id}:${deviceId}`,
-    response.jti,
+    newJti,
     "EX",
     config.REFRESH_TOKEN_EXP_SEC,
   );

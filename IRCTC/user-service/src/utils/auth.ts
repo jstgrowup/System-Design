@@ -11,6 +11,14 @@ interface RefreshTokenPayload extends JwtPayload {
   jti: string; // unique token ID used for reuse detection
 }
 
+/** Return shape of generateRefreshToken — callers need the jti to store in
+ * Redis for reuse detection, so it's returned alongside the signed token
+ * instead of making them jwt.decode() what was just signed. */
+interface RefreshTokenResult {
+  token: string;
+  jti: string;
+}
+
 /** Creates a SHA-256 hash of a token — used for safe storage/comparison */
 export const hashToken = (refreshToken: string): string => {
   return crypto.createHash("sha256").update(refreshToken).digest("hex");
@@ -24,15 +32,14 @@ export const generateAccessToken = (userId: string): string => {
   });
 };
 
-/** Signs a long-lived refresh token (7d) with user ID + unique JTI */
-export const generateRefreshToken = (userId: string): string => {
-  const payload: RefreshTokenPayload = {
-    id: userId,
-    jti: crypto.randomUUID(), // unique per token issuance
-  };
-  return jwt.sign(payload, config.JWT_REFRESH_SECRET, {
+/** Signs a long-lived refresh token (7d) with user ID + unique JTI, returning both */
+export const generateRefreshToken = (userId: string): RefreshTokenResult => {
+  const jti = crypto.randomUUID(); // unique per token issuance
+  const payload: RefreshTokenPayload = { id: userId, jti };
+  const token = jwt.sign(payload, config.JWT_REFRESH_SECRET, {
     expiresIn: config.REFRESH_TOKEN_EXP as StringValue,
   });
+  return { token, jti };
 };
 
 /** Verifies an access token — throws if expired or tampered */

@@ -717,21 +717,22 @@ const verifyOtp = async ({
 
 Both changes described in the Overview land right here: the `sendWelcomeEmail` call (wrapped in its own try/catch, log-only on failure) didn't exist before this session, and the `const { password: _password, ...safeUser } = user; return safeUser;` line replaces what used to be `return user;` — the created row, bcrypt hash included, returned straight to the HTTP client.
 
-`login` and `rotateRefreshToken` are unchanged by this session — see [Lifecycle Walkthroughs](#lifecycle-walkthroughs) Case B above for `rotateRefreshToken`'s reuse-detection behavior in detail.
+See [Lifecycle Walkthroughs](#lifecycle-walkthroughs) Case B above for `rotateRefreshToken`'s reuse-detection behavior in detail.
 
-**`utils/auth.ts`** — JWT sign/verify helpers, unchanged this session:
+**`utils/auth.ts`** — JWT sign/verify helpers:
 
 ```typescript
-export const generateRefreshToken = (userId: string): string => {
-  const payload: RefreshTokenPayload = {
-    id: userId,
-    jti: crypto.randomUUID(), // unique per token issuance
-  };
-  return jwt.sign(payload, config.JWT_REFRESH_SECRET, {
+export const generateRefreshToken = (userId: string): RefreshTokenResult => {
+  const jti = crypto.randomUUID(); // unique per token issuance
+  const payload: RefreshTokenPayload = { id: userId, jti };
+  const token = jwt.sign(payload, config.JWT_REFRESH_SECRET, {
     expiresIn: config.REFRESH_TOKEN_EXP as StringValue,
   });
+  return { token, jti };
 };
 ```
+
+`generateRefreshToken` returns `{ token, jti }` rather than just the signed string. Both `login` and `rotateRefreshToken` (in `auth.service.ts`) need the `jti` to store in Redis for reuse detection — returning it directly means neither caller has to `jwt.decode()` the token it just signed to recover a value it already had in hand. `login`'s two independent Redis writes (the refresh-token `jti` and the cached user profile) also run via `Promise.all` now, since neither depends on the other's result.
 
 `hashToken` (a SHA-256 helper) is exported from this file but never called anywhere in the service — see [Known Issues](#known-issues--inconsistencies).
 
