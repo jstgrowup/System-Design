@@ -3,11 +3,24 @@
 Tracks exactly where the code walkthrough (see `docs/learning-mode.md`) left
 off, so the next session can resume mid-function instead of restarting.
 
+## Paused mid-function — resume here later
+
+**Service:** `user-service`
+**Currently on:** `POST /verify-otp` — paused mid-`verifyOtpViaUnHashing`,
+right after the `timingSafeEqual` comparison block. Not yet covered: the
+success branch (deleting Redis keys) and failure branch (incrementing
+attempts) of that function, then the rest of `authservice.verifyOtp` (user
+creation, fire-and-forget welcome email, stripping `password` before
+returning `safeUser`). See "Not yet started" below for the full detail of
+where this was left off — that detail is preserved, just no longer the
+active position.
+
 ## Current position
 
 **Service:** `user-service`
 **Flow:** Registration — `/send-otp` → `/verify-otp` → `/login` → `/refresh`
-**Currently on:** `POST /verify-otp`
+**Currently on:** `POST /login` — jumped here deliberately at the user's
+request, skipping ahead of the paused `/verify-otp` work above.
 
 ### Covered so far
 
