@@ -71,7 +71,9 @@ const fetchUserForNotification = async (
   }
 };
 
-const fetchStationName = async (stationId: string | null): Promise<string | null> => {
+const fetchStationName = async (
+  stationId: string | null,
+): Promise<string | null> => {
   if (!stationId) return null;
   try {
     const station = await stationClient.getStationById(stationId);
@@ -91,8 +93,12 @@ const fetchStationName = async (stationId: string | null): Promise<string | null
 // conversion: IdempotencyRecord.response is a Prisma Json column, and
 // CreateBookingResult is a plain interface with no index signature, so
 // neither direction satisfies Prisma's Json typing structurally on its own.
-const checkIdempotency = async (key: string): Promise<CreateBookingResult | null> => {
-  const existing = await prisma.idempotencyRecord.findUnique({ where: { eventKey: key } });
+const checkIdempotency = async (
+  key: string,
+): Promise<CreateBookingResult | null> => {
+  const existing = await prisma.idempotencyRecord.findUnique({
+    where: { eventKey: key },
+  });
   if (existing) {
     logger.info(`Idempotent request: ${key}`);
     return existing.response as unknown as CreateBookingResult;
@@ -100,7 +106,10 @@ const checkIdempotency = async (key: string): Promise<CreateBookingResult | null
   return null;
 };
 
-const saveIdempotency = async (key: string, response: CreateBookingResult): Promise<void> => {
+const saveIdempotency = async (
+  key: string,
+  response: CreateBookingResult,
+): Promise<void> => {
   await prisma.idempotencyRecord.create({
     data: { eventKey: key, response: response as unknown as object },
   });
@@ -142,7 +151,12 @@ const createBooking = async (
   const seatMap = new Map(seatData.seats.map((s) => [s.seatId, s]));
 
   // Verify all requested seats exist and are available
-  const bookingSeats: { seatId: string; seatNumber: number; seatType: string; price: number }[] = [];
+  const bookingSeats: {
+    seatId: string;
+    seatNumber: number;
+    seatType: string;
+    price: number;
+  }[] = [];
   let totalAmount = 0;
   for (const seatId of seatIds) {
     const seat = seatMap.get(seatId);
@@ -187,7 +201,9 @@ const createBooking = async (
   let booking: Booking | undefined;
   try {
     // 5. Create booking record in DB
-    const lockExpiresAt = new Date(Date.now() + config.BOOKING_TTL_SECONDS * 1000);
+    const lockExpiresAt = new Date(
+      Date.now() + config.BOOKING_TTL_SECONDS * 1000,
+    );
 
     booking = await prisma.booking.create({
       data: {
@@ -227,7 +243,13 @@ const createBooking = async (
     });
 
     // 6. Execute saga Step 1: Hold seats in inventory
-    await saga.executeHoldSeats(booking, sortedSeatIds, config.LOCK_TTL_SECONDS, fromSeq, toSeq);
+    await saga.executeHoldSeats(
+      booking,
+      sortedSeatIds,
+      config.LOCK_TTL_SECONDS,
+      fromSeq,
+      toSeq,
+    );
 
     // 7. Execute saga Step 2: Create payment order
     const paymentOrder = await saga.executeCreatePayment(booking);
@@ -285,7 +307,13 @@ const createBooking = async (
     }
 
     // Release Redis locks (segment-aware)
-    await releaseSeatLocks(scheduleId, sortedSeatIds, lockValue, fromSeq, toSeq);
+    await releaseSeatLocks(
+      scheduleId,
+      sortedSeatIds,
+      lockValue,
+      fromSeq,
+      toSeq,
+    );
 
     throw error;
   }
@@ -315,7 +343,9 @@ const handlePaymentSuccess = async (
   }
 
   if (booking.status !== "PAYMENT_PENDING") {
-    logger.warn(`Booking ${booking.id} in unexpected status: ${booking.status}`);
+    logger.warn(
+      `Booking ${booking.id} in unexpected status: ${booking.status}`,
+    );
     return;
   }
 
@@ -323,10 +353,17 @@ const handlePaymentSuccess = async (
 
   try {
     // Atomically claim this booking — if expiry job or cancel already changed it, bail out
-    await casUpdateBooking(booking.id, booking.version, { status: "CONFIRMING" });
+    await casUpdateBooking(booking.id, booking.version, {
+      status: "CONFIRMING",
+    });
 
     // Execute saga Step 3: Confirm seats in inventory
-    await saga.executeConfirmSeats(booking, seatIds, booking.fromSeq, booking.toSeq);
+    await saga.executeConfirmSeats(
+      booking,
+      seatIds,
+      booking.fromSeq,
+      booking.toSeq,
+    );
 
     // Final status update (version was already incremented by CAS above)
     await prisma.booking.updateMany({
@@ -335,7 +372,12 @@ const handlePaymentSuccess = async (
     });
 
     // Release Redis locks (segment-aware)
-    await forceReleaseSeatLocks(booking.scheduleId, seatIds, booking.fromSeq, booking.toSeq);
+    await forceReleaseSeatLocks(
+      booking.scheduleId,
+      seatIds,
+      booking.fromSeq,
+      booking.toSeq,
+    );
 
     // Publish BOOKING_CONFIRMED (retried by producer — log but don't fail the booking)
     try {
@@ -379,7 +421,9 @@ const handlePaymentSuccess = async (
   } catch (error) {
     // If StaleStateError, another process already handled this booking — do nothing
     if (error instanceof StaleStateError) {
-      logger.info(`Booking ${booking.id} already handled by another process, skipping`);
+      logger.info(
+        `Booking ${booking.id} already handled by another process, skipping`,
+      );
       return;
     }
 
@@ -391,7 +435,10 @@ const handlePaymentSuccess = async (
     await saga.compensateAll(booking, seatIds);
 
     await prisma.booking.updateMany({
-      where: { id: booking.id, status: { in: ["PAYMENT_PENDING", "CONFIRMING"] } },
+      where: {
+        id: booking.id,
+        status: { in: ["PAYMENT_PENDING", "CONFIRMING"] },
+      },
       data: {
         status: "FAILED",
         failureReason: `confirm_failed: ${(error as Error).message}`,
@@ -399,7 +446,12 @@ const handlePaymentSuccess = async (
       },
     });
 
-    await forceReleaseSeatLocks(booking.scheduleId, seatIds, booking.fromSeq, booking.toSeq);
+    await forceReleaseSeatLocks(
+      booking.scheduleId,
+      seatIds,
+      booking.fromSeq,
+      booking.toSeq,
+    );
 
     try {
       const userInfo = await fetchUserForNotification(booking.userId);
@@ -438,12 +490,16 @@ const handlePaymentFailure = async (
 
   // Idempotent
   if (["FAILED", "CANCELLED", "EXPIRED"].includes(booking.status)) {
-    logger.info(`Booking ${booking.id} already in terminal state: ${booking.status}`);
+    logger.info(
+      `Booking ${booking.id} already in terminal state: ${booking.status}`,
+    );
     return;
   }
 
   if (booking.status !== "PAYMENT_PENDING") {
-    logger.warn(`Booking ${booking.id} in unexpected status: ${booking.status}`);
+    logger.warn(
+      `Booking ${booking.id} in unexpected status: ${booking.status}`,
+    );
     return;
   }
 
@@ -457,7 +513,9 @@ const handlePaymentFailure = async (
     });
   } catch (error) {
     if (error instanceof StaleStateError) {
-      logger.info(`Booking ${booking.id} already handled by another process, skipping`);
+      logger.info(
+        `Booking ${booking.id} already handled by another process, skipping`,
+      );
       return;
     }
     throw error;
@@ -467,7 +525,12 @@ const handlePaymentFailure = async (
   await saga.compensateHoldSeats(booking, seatIds);
 
   // Release Redis locks (segment-aware)
-  await forceReleaseSeatLocks(booking.scheduleId, seatIds, booking.fromSeq, booking.toSeq);
+  await forceReleaseSeatLocks(
+    booking.scheduleId,
+    seatIds,
+    booking.fromSeq,
+    booking.toSeq,
+  );
 
   // Publish BOOKING_FAILED
   try {
@@ -505,7 +568,11 @@ const cancelBooking = async (
     throw new NotFoundError("Booking not found");
   }
 
-  if (["CANCELLED", "CANCELLING", "FAILED", "EXPIRED", "CONFIRMING"].includes(booking.status)) {
+  if (
+    ["CANCELLED", "CANCELLING", "FAILED", "EXPIRED", "CONFIRMING"].includes(
+      booking.status,
+    )
+  ) {
     throw new ConflictError(`Booking is already ${booking.status}`);
   }
 
@@ -521,7 +588,9 @@ const cancelBooking = async (
   } catch (error) {
     if (error instanceof StaleStateError) {
       // Re-read to give user accurate error
-      const fresh = await prisma.booking.findUnique({ where: { id: bookingId } });
+      const fresh = await prisma.booking.findUnique({
+        where: { id: bookingId },
+      });
       throw new ConflictError(
         `Booking status changed to ${fresh?.status || "unknown"} while cancelling. Please refresh.`,
       );
@@ -532,11 +601,18 @@ const cancelBooking = async (
   if (booking.status === "CONFIRMED") {
     // Cancel confirmed booking: release seats + refund
     try {
-      await inventoryClient.cancelBooking(booking.scheduleId, booking.id, booking.userId);
+      await inventoryClient.cancelBooking(
+        booking.scheduleId,
+        booking.id,
+        booking.userId,
+      );
     } catch (error) {
-      logger.error(`Failed to release seats in inventory for booking ${booking.id}`, {
-        error: (error as Error).message,
-      });
+      logger.error(
+        `Failed to release seats in inventory for booking ${booking.id}`,
+        {
+          error: (error as Error).message,
+        },
+      );
       // Roll back from CANCELLING to CONFIRMED so the user can retry
       await prisma.booking.updateMany({
         where: { id: booking.id, status: "CANCELLING" },
@@ -592,7 +668,12 @@ const cancelBooking = async (
   });
 
   // Release Redis locks (segment-aware)
-  await forceReleaseSeatLocks(booking.scheduleId, seatIds, booking.fromSeq, booking.toSeq);
+  await forceReleaseSeatLocks(
+    booking.scheduleId,
+    seatIds,
+    booking.fromSeq,
+    booking.toSeq,
+  );
 
   // Publish BOOKING_CANCELLED
   try {
@@ -624,7 +705,10 @@ const cancelBooking = async (
 
 // ─── Get Booking ─────────────────────────────────────────────────────────────
 
-const getBooking = async (bookingId: string, userId: string): Promise<BookingDetail> => {
+const getBooking = async (
+  bookingId: string,
+  userId: string,
+): Promise<BookingDetail> => {
   const booking = await prisma.booking.findUnique({
     where: { id: bookingId },
     include: {
@@ -767,7 +851,9 @@ const verifyPayment = async (
   }
 
   if (booking.status !== "PAYMENT_PENDING") {
-    throw new ConflictError(`Booking is in ${booking.status} status, cannot verify payment`);
+    throw new ConflictError(
+      `Booking is in ${booking.status} status, cannot verify payment`,
+    );
   }
 
   // Call payment service to verify and capture
@@ -789,7 +875,9 @@ const verifyPayment = async (
 // When a schedule is cancelled, all active bookings on that schedule must be
 // failed/cancelled so users aren't left with stranded tickets.
 
-const handleScheduleCancelled = async (scheduleId: string | undefined): Promise<void> => {
+const handleScheduleCancelled = async (
+  scheduleId: string | undefined,
+): Promise<void> => {
   if (!scheduleId) {
     logger.warn("handleScheduleCancelled called without scheduleId");
     return;
@@ -820,7 +908,9 @@ const handleScheduleCancelled = async (scheduleId: string | undefined): Promise<
         where: {
           id: booking.id,
           version: booking.version,
-          status: { in: ["PENDING", "SEATS_HELD", "PAYMENT_PENDING", "CONFIRMED"] },
+          status: {
+            in: ["PENDING", "SEATS_HELD", "PAYMENT_PENDING", "CONFIRMED"],
+          },
         },
         data: {
           status: "CANCELLED",
@@ -830,14 +920,21 @@ const handleScheduleCancelled = async (scheduleId: string | undefined): Promise<
       });
 
       if (claimed.count === 0) {
-        logger.info(`Booking ${booking.id} already handled, skipping schedule-cancel`);
+        logger.info(
+          `Booking ${booking.id} already handled, skipping schedule-cancel`,
+        );
         continue;
       }
 
       const seatIds = booking.seats.map((s) => s.seatId).sort();
 
       // Release Redis locks if any are still held
-      await forceReleaseSeatLocks(booking.scheduleId, seatIds, booking.fromSeq, booking.toSeq);
+      await forceReleaseSeatLocks(
+        booking.scheduleId,
+        seatIds,
+        booking.fromSeq,
+        booking.toSeq,
+      );
 
       // Initiate refund for confirmed bookings that had payment
       if (booking.status === "CONFIRMED" && booking.paymentOrderId) {
@@ -867,20 +964,29 @@ const handleScheduleCancelled = async (scheduleId: string | undefined): Promise<
           firstName: userInfo.firstName,
           scheduleId: booking.scheduleId,
           reason: "schedule_cancelled",
-          refundAmount: booking.status === "CONFIRMED" ? booking.totalAmount : 0,
+          refundAmount:
+            booking.status === "CONFIRMED" ? booking.totalAmount : 0,
         });
       } catch (err) {
-        logger.error("Failed to publish BOOKING_CANCELLED for schedule cancellation", {
-          bookingId: booking.id,
-          error: (err as Error).message,
-        });
+        logger.error(
+          "Failed to publish BOOKING_CANCELLED for schedule cancellation",
+          {
+            bookingId: booking.id,
+            error: (err as Error).message,
+          },
+        );
       }
 
-      logger.info(`Booking ${booking.id} cancelled due to schedule cancellation`);
+      logger.info(
+        `Booking ${booking.id} cancelled due to schedule cancellation`,
+      );
     } catch (error) {
-      logger.error(`Failed to cancel booking ${booking.id} during schedule cancellation`, {
-        error: (error as Error).message,
-      });
+      logger.error(
+        `Failed to cancel booking ${booking.id} during schedule cancellation`,
+        {
+          error: (error as Error).message,
+        },
+      );
     }
   }
 };

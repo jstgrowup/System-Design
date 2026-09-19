@@ -25,8 +25,8 @@ into the code.
 moving past this file.
 
 **Not yet covered in this file:** `sendMessage<T>` (the generic send
-helper — try/catch, logging, the `key || `${topic}-${Date.now()}`` fallback),
-and the two public methods `sendOtpEmail`/`sendWelcomeEmail`.
+helper — try/catch, logging, the `key || `${topic}-${Date.now()}``fallback),
+and the two public methods`sendOtpEmail`/`sendWelcomeEmail`.
 
 **Not yet opened:** `notification-service/` entirely (the consumer side —
 `kafka/email-consumer.ts`, `services/email-service.ts`, `templates/index.ts`).
@@ -97,30 +97,30 @@ and the two public methods `sendOtpEmail`/`sendWelcomeEmail`.
     `/refresh`); why truncating to 16 chars is an acceptable tradeoff here
     (this is a soft device-binding tag, not a cryptographic identity — a
     collision doesn't leak anyone's tokens). ✅
-  - `auth.service.ts::login`:
-    - `prisma.user.findUnique` + `!existingUser.password` check → throws
-      `"Email not found"` — ✅ (noted: unlike `/verify-otp`'s deliberately
-      collapsed "expired vs. wrong OTP" error, `/login` throws two
-      *distinguishable* errors — `"Email not found"` vs.
-      `"Incorrect password"` — which lets an attacker enumerate valid
-      emails; discussed as a real inconsistency, left as-is per
-      learning-mode convention of not fixing while documenting/learning)
-    - `bcrypt.compare(password, existingUser.password)` → throws
-      `"Incorrect password"` — ✅
-    - `generateAccessToken` / `generateRefreshToken` — ✅. Covered: why
-      `generateRefreshToken` returns `{ token, jti }` together instead of
-      making the caller `jwt.decode()` the token back out afterward (the
-      JTI already exists in memory at signing time; returning it avoids a
-      redundant decode). Also covered: `jti` is a server-side-only
-      tracking value, never sent to the client — only `accessToken`/
-      `refreshToken` are.
-    - `{ password: _password, ...safeUser }` strip — ✅ (same pattern as
-      `verifyOtp`'s `safeUser`)
-    - `Promise.all([...])` writing `refresh:<userId>:<deviceId>` → `jti`
-      (TTL = `REFRESH_TOKEN_EXP_SEC`) and `user:<userId>` → cached
-      `safeUser` JSON (TTL = `REDIS_USER_TTL`) concurrently, since neither
-      write depends on the other — ✅
-    - returns `{ accessToken, refreshToken, loggedInUser: safeUser }` — ✅
+  - `auth.service.ts::login`: - `prisma.user.findUnique` + `!existingUser.password` check → throws
+    `"Email not found"` — ✅ (noted: unlike `/verify-otp`'s deliberately
+    collapsed "expired vs. wrong OTP" error, `/login` throws two
+    _distinguishable_ errors — `"Email not found"` vs.
+    `"Incorrect password"` — which lets an attacker enumerate valid
+    emails; discussed as a real inconsistency, left as-is per
+    learning-mode convention of not fixing while documenting/learning) - `bcrypt.compare(password, existingUser.password)` → throws
+    `"Incorrect password"` — ✅ - `generateAccessToken` / `generateRefreshToken` — ✅. Covered: why
+    `generateRefreshToken` returns `{ token, jti }` together instead of
+    making the caller `jwt.decode()` the token back out afterward (the
+    JTI already exists in memory at signing time; returning it avoids a
+    redundant decode). Also covered: `jti` is a server-side-only
+    tracking value, never sent to the client — only `accessToken`/
+    `refreshToken` are. - `{ password: _password, ...safeUser }` strip — ✅ (same pattern as
+    `verifyOtp`'s `safeUser`) - `Promise.all([...])` writing `refresh:<userId>:<deviceId>` → `jti`
+    (TTL = `REFRESH_TOKEN_EXP_SEC`) and `user:<userId>` → cached
+    `safeUser` JSON (TTL = `REDIS_USER_TTL`) concurrently, since neither
+    write dsave
+    iOS Developer
+    Vtechfamily Solution India logo
+    Vtechfamily Solution Indias
+    3.4
+    3 Reviews
+    2-4 YrsNepends on the other — ✅ - returns `{ accessToken, refreshToken, loggedInUser: safeUser }` — ✅
 
 - **`/refresh`** — fully walked end to end (playlist video 6):
   - `auth.route.ts` — plain route, no middleware. ✅
@@ -136,12 +136,12 @@ and the two public methods `sendOtpEmail`/`sendWelcomeEmail`.
       `ForbiddenError("Session expired")` if key missing — ✅
     - `storedJti !== jti` reuse-detection branch: deletes the Redis key
       and throws `"Refresh token reused"` — ✅. Covered: why this kills
-      the *whole* device session rather than just rejecting the one call
+      the _whole_ device session rather than just rejecting the one call
       (server can't tell attacker from legitimate caller when JTIs
       mismatch, since refresh tokens are single-use and Redis only ever
       holds the latest JTI).
     - new `generateAccessToken`/`generateRefreshToken` call using
-      `payload.id` — ✅ (confirmed: yes, `/refresh` rotates *both* tokens,
+      `payload.id` — ✅ (confirmed: yes, `/refresh` rotates _both_ tokens,
       not just the access token — that's what makes reuse of an old
       refresh token always detectable)
     - `redis.set` overwriting the JTI at the same key — ✅
